@@ -1,0 +1,76 @@
+import unittest
+from pathlib import Path
+
+from controllers.auth_controller import authenticate
+from utils import permissions as perm
+from utils import session
+from views.main_view import MainView
+
+PASSWORD = "FireDemo2026!"
+VIEW_SOURCE = Path(__file__).resolve().parent.parent / "views" / "main_view.py"
+
+VIEW_ONLY = {perm.PERMISSION_VIEW_OPERATIONAL_DATA, perm.PERMISSION_VIEW_REPORTS}
+ADMIN_ONLY = {
+    perm.PERMISSION_MANAGE_USERS,
+    perm.PERMISSION_MANAGE_CATALOGS,
+    perm.PERMISSION_VIEW_AUDIT,
+}
+
+
+class MainViewAccessTest(unittest.TestCase):
+    def setUp(self):
+        session.end_session()
+        self.windows = []
+
+    def tearDown(self):
+        for window in self.windows:
+            window.destroy()
+        session.end_session()
+
+    def open_view(self, username):
+        user = authenticate(username, PASSWORD)
+        self.assertIsNotNone(user, f"No se pudo autenticar a {username}")
+        session.start_session(user)
+        view = MainView(user)
+        self.windows.append(view)
+        view.update()
+        return view
+
+    def test_admin_sees_everything(self):
+        view = self.open_view("admin.demo")
+        self.assertEqual(view.granted_permissions, perm.ALL_PERMISSIONS)
+        self.assertEqual(set(view.access_widgets), set(perm.ALL_PERMISSIONS))
+        self.assertIsNone(view.read_only_label)
+
+    def test_operator_has_no_admin_items(self):
+        view = self.open_view("operador.central")
+        expected = set(perm.ALL_PERMISSIONS) - ADMIN_ONLY
+        self.assertEqual(set(view.access_widgets), expected)
+        for permission in ADMIN_ONLY:
+            self.assertNotIn(permission, view.access_widgets)
+        self.assertIsNone(view.read_only_label)
+
+    def test_read_only_user_sees_only_view_items(self):
+        view = self.open_view("consulta.sur")
+        self.assertEqual(set(view.access_widgets), VIEW_ONLY)
+        self.assertIsNotNone(view.read_only_label)
+        self.assertEqual(view.read_only_label.cget("text"), "Modo solo lectura")
+        self.assertTrue(view.read_only_label.winfo_ismapped())
+
+    def test_without_session_nothing_is_offered(self):
+        # Sin sesión el controlador falla cerrado y no se ofrece nada
+        user = {"first_name": "A", "last_name": "B", "username": "x", "role_code": "X"}
+        view = MainView(user)
+        self.windows.append(view)
+        view.update()
+        self.assertEqual(view.access_widgets, {})
+        self.assertIsNotNone(view.read_only_label)
+
+    def test_view_does_not_duplicate_role_policy(self):
+        source = VIEW_SOURCE.read_text(encoding="utf-8")
+        for role in ("ADMINISTRADOR", "OPERADOR", "CONSULTA"):
+            self.assertNotIn(role, source)
+
+
+if __name__ == "__main__":
+    unittest.main()
