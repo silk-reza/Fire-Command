@@ -289,7 +289,7 @@ mysql -u root -p firecommand < database/seed.sql
 
 El esquema crea y selecciona la base `firecommand`, así que no es necesario crearla a mano. El segundo comando es **solo para una base limpia de demostración**.
 
-> **Nota sobre nombres:** el encabezado de `seed.sql` recibido menciona `FIRECOMMAND_schema_FINAL.sql`, pero el esquema entregado se llama `schema.sql`. Confirma que ambos sean las versiones compatibles de v1.0 y usa el nombre real del archivo en tu repositorio.
+> **Nota sobre nombres:** el encabezado de `seed.sql` recibido menciona `FIRECOMMAND_schema_FINAL.sql`, pero el esquema entregado se renombro a `schema.sql`.
 
 ### 5. Crear usuario MySQL de aplicación
 
@@ -380,4 +380,4 @@ El README resume el proyecto; `docs/` concentra el detalle técnico.
 
 ---
 
-*FireCommand v1.0 — proyecto académico en desarrollo para la gestión de recursos y operaciones bomberiles.*
+*FireCommand v1.0 — proyecto académico universitario en desarrollo para la gestión de recursos y operaciones bomberiles. - Universidad Mariano Gálvez de Guatemala (UMG)*
