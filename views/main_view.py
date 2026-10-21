@@ -3,6 +3,7 @@ import customtkinter as ctk
 from controllers import access_controller
 from utils import permissions as perm
 from utils import session
+from views.user_view import UserView
 
 READ_ONLY_TEXT = "Modo solo lectura"
 PENDING_NOTE = "disponible según su rol (módulo pendiente)"
@@ -28,6 +29,7 @@ class MainView(ctk.CTk):
         self.title("FireCommand")
         self.resizable(False, False)
         self.logged_out = False
+        self.user_view = None
 
         frame = ctk.CTkFrame(self)
         frame.pack(padx=30, pady=30)
@@ -49,10 +51,16 @@ class MainView(ctk.CTk):
         ctk.CTkLabel(frame, text="Accesos disponibles").pack(padx=30, pady=(15, 4))
         self.access_widgets = {}
         for permission, text in ACCESS_ITEMS:
-            if access_controller.can(permission):
-                label = ctk.CTkLabel(frame, text=f"{text}: {PENDING_NOTE}")
-                label.pack(padx=30, pady=2, anchor="w")
-                self.access_widgets[permission] = label
+            if not access_controller.can(permission):
+                continue
+            if permission == perm.PERMISSION_MANAGE_USERS:
+                # Módulo real: botón que abre la administración de usuarios
+                widget = ctk.CTkButton(frame, text="Usuarios", command=self.open_users)
+                widget.pack(padx=30, pady=4, anchor="w")
+            else:
+                widget = ctk.CTkLabel(frame, text=f"{text}: {PENDING_NOTE}")
+                widget.pack(padx=30, pady=2, anchor="w")
+            self.access_widgets[permission] = widget
         self.granted_permissions = frozenset(self.access_widgets)
 
         self.logout_button = ctk.CTkButton(frame, text="Cerrar sesión", command=self.logout)
@@ -64,6 +72,14 @@ class MainView(ctk.CTk):
         x = (self.winfo_screenwidth() - self.winfo_reqwidth()) // 2
         y = (self.winfo_screenheight() - self.winfo_reqheight()) // 3
         self.geometry(f"+{x}+{y}")
+
+    def open_users(self):
+        """Abre el módulo de usuarios; si ya está abierto, lo trae al frente."""
+        if self.user_view is not None and self.user_view.winfo_exists():
+            self.user_view.lift()
+            return self.user_view
+        self.user_view = UserView(self, on_session_ended=self.logout)
+        return self.user_view
 
     def logout(self):
         """Limpia la sesión y pide volver al login."""
