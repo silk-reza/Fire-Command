@@ -3,6 +3,7 @@ import customtkinter as ctk
 from controllers import access_controller
 from utils import permissions as perm
 from utils import session
+from views.station_view import StationView
 from views.user_view import UserView
 
 READ_ONLY_TEXT = "Modo solo lectura"
@@ -30,6 +31,7 @@ class MainView(ctk.CTk):
         self.resizable(False, False)
         self.logged_out = False
         self.user_view = None
+        self.station_view = None
 
         frame = ctk.CTkFrame(self)
         frame.pack(padx=30, pady=30)
@@ -57,6 +59,10 @@ class MainView(ctk.CTk):
                 # Módulo real: botón que abre la administración de usuarios
                 widget = ctk.CTkButton(frame, text="Usuarios", command=self.open_users)
                 widget.pack(padx=30, pady=4, anchor="w")
+            elif permission == perm.PERMISSION_MANAGE_CATALOGS:
+                # Por ahora el único catálogo implementado es el de estaciones
+                widget = ctk.CTkButton(frame, text="Estaciones", command=self.open_stations)
+                widget.pack(padx=30, pady=4, anchor="w")
             else:
                 widget = ctk.CTkLabel(frame, text=f"{text}: {PENDING_NOTE}")
                 widget.pack(padx=30, pady=2, anchor="w")
@@ -80,6 +86,18 @@ class MainView(ctk.CTk):
             return self.user_view
         self.user_view = UserView(self, on_session_ended=self.logout)
         return self.user_view
+
+    def open_stations(self):
+        """Abre el módulo de estaciones; si ya está abierto, lo trae al frente.
+
+        Los módulos son modales: mientras uno está abierto la ventana principal
+        queda bloqueada, así que hay que usar Regresar antes de abrir otro.
+        """
+        if self.station_view is not None and self.station_view.winfo_exists():
+            self.station_view.lift()
+            return self.station_view
+        self.station_view = StationView(self)
+        return self.station_view
 
     def logout(self):
         """Limpia la sesión y pide volver al login."""

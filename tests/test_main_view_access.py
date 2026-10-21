@@ -41,6 +41,8 @@ class MainViewAccessTest(unittest.TestCase):
         self.assertEqual(view.granted_permissions, perm.ALL_PERMISSIONS)
         self.assertEqual(set(view.access_widgets), set(perm.ALL_PERMISSIONS))
         self.assertIsNone(view.read_only_label)
+        # Catálogos ya no es una etiqueta pendiente: abre el módulo de estaciones
+        self.assertEqual(view.access_widgets[perm.PERMISSION_MANAGE_CATALOGS].cget("text"), "Estaciones")
 
     def test_operator_has_no_admin_items(self):
         view = self.open_view("operador.central")
