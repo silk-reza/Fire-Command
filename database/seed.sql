@@ -15,7 +15,8 @@
 --
 -- IMPORTANTE:
 --   Ejecutar sobre una base limpia creada con:
---   FIRECOMMAND_schema_FINAL.sql
+--   FIRECOMMAND_schema_FINAL.sql o en su defecto la versión renombrada a schema.sql
+--   FIRECOMMAND_schema_FINAL.sql y schema.sql son el mismo archivo con diferente nombre.
 --
 --   Este script NO usa INSERT IGNORE ni ON DUPLICATE KEY UPDATE.
 --   Si se ejecuta dos veces sobre los mismos datos, debe fallar.
