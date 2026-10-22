@@ -3,6 +3,7 @@ import customtkinter as ctk
 from controllers import access_controller
 from utils import permissions as perm
 from utils import session
+from views.personnel_view import PersonnelView
 from views.station_view import StationView
 from views.user_view import UserView
 
@@ -32,6 +33,7 @@ class MainView(ctk.CTk):
         self.logged_out = False
         self.user_view = None
         self.station_view = None
+        self.personnel_view = None
 
         frame = ctk.CTkFrame(self)
         frame.pack(padx=30, pady=30)
@@ -62,6 +64,10 @@ class MainView(ctk.CTk):
             elif permission == perm.PERMISSION_MANAGE_CATALOGS:
                 # Por ahora el único catálogo implementado es el de estaciones
                 widget = ctk.CTkButton(frame, text="Estaciones", command=self.open_stations)
+                widget.pack(padx=30, pady=4, anchor="w")
+            elif permission == perm.PERMISSION_MANAGE_RESOURCES:
+                # Recursos: por ahora solo el módulo de personal
+                widget = ctk.CTkButton(frame, text="Personal", command=self.open_personnel)
                 widget.pack(padx=30, pady=4, anchor="w")
             else:
                 widget = ctk.CTkLabel(frame, text=f"{text}: {PENDING_NOTE}")
@@ -98,6 +104,14 @@ class MainView(ctk.CTk):
             return self.station_view
         self.station_view = StationView(self)
         return self.station_view
+
+    def open_personnel(self):
+        """Abre el módulo de personal; si ya está abierto, lo trae al frente."""
+        if self.personnel_view is not None and self.personnel_view.winfo_exists():
+            self.personnel_view.lift()
+            return self.personnel_view
+        self.personnel_view = PersonnelView(self)
+        return self.personnel_view
 
     def logout(self):
         """Limpia la sesión y pide volver al login."""

@@ -1,6 +1,8 @@
 import unittest
 from pathlib import Path
 
+import customtkinter as ctk
+
 from controllers.auth_controller import authenticate
 from utils import permissions as perm
 from utils import session
@@ -43,6 +45,7 @@ class MainViewAccessTest(unittest.TestCase):
         self.assertIsNone(view.read_only_label)
         # Catálogos ya no es una etiqueta pendiente: abre el módulo de estaciones
         self.assertEqual(view.access_widgets[perm.PERMISSION_MANAGE_CATALOGS].cget("text"), "Estaciones")
+        self.assertEqual(view.access_widgets[perm.PERMISSION_MANAGE_RESOURCES].cget("text"), "Personal")
 
     def test_operator_has_no_admin_items(self):
         view = self.open_view("operador.central")
@@ -51,6 +54,16 @@ class MainViewAccessTest(unittest.TestCase):
         for permission in ADMIN_ONLY:
             self.assertNotIn(permission, view.access_widgets)
         self.assertIsNone(view.read_only_label)
+        # Recursos abre el módulo de personal; no hay botones de usuarios ni estaciones
+        resources = view.access_widgets[perm.PERMISSION_MANAGE_RESOURCES]
+        self.assertEqual(resources.cget("text"), "Personal")
+        texts = [
+            w.cget("text") for w in view.winfo_children()[0].winfo_children()
+            if isinstance(w, ctk.CTkButton)
+        ]
+        self.assertIn("Personal", texts)
+        self.assertNotIn("Estaciones", texts)
+        self.assertNotIn("Usuarios", texts)
 
     def test_read_only_user_sees_only_view_items(self):
         view = self.open_view("consulta.sur")
