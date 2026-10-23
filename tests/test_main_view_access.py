@@ -84,6 +84,13 @@ class MainViewAccessTest(unittest.TestCase):
         self.assertEqual(view.read_only_label.cget("text"), "Modo solo lectura")
         self.assertTrue(view.read_only_label.winfo_ismapped())
 
+    def test_every_role_has_separate_query_button(self):
+        for username in ("admin.demo", "operador.central", "consulta.sur"):
+            view = self.open_view(username)
+            self.assertEqual(view.query_button.cget("text"), "Consultar incidentes")
+            self.assertIsNot(view.query_button, view.incidents_button)
+            self.assertNotIn(view.query_button, view.access_widgets.values())
+
     def test_without_session_nothing_is_offered(self):
         # Sin sesión el controlador falla cerrado y no se ofrece nada
         user = {"first_name": "A", "last_name": "B", "username": "x", "role_code": "X"}

@@ -3,6 +3,7 @@ import customtkinter as ctk
 from controllers import access_controller
 from utils import permissions as perm
 from utils import session
+from views.incident_query_view import IncidentQueryView
 from views.incident_view import IncidentView
 from views.personnel_view import PersonnelView
 from views.station_view import StationView
@@ -40,6 +41,8 @@ class MainView(ctk.CTk):
         self.units_button = None
         self.incident_view = None
         self.incidents_button = None
+        self.incident_query_view = None
+        self.query_button = None
 
         frame = ctk.CTkFrame(self)
         frame.pack(padx=30, pady=30)
@@ -84,6 +87,15 @@ class MainView(ctk.CTk):
                         frame, text="Incidentes", command=self.open_incidents
                     )
                     self.incidents_button.pack(padx=30, pady=4, anchor="w")
+                if (
+                    self.query_button is None
+                    and access_controller.can(perm.PERMISSION_VIEW_OPERATIONAL_DATA)
+                ):
+                    # Consulta de solo lectura, distinta del CRUD de incidentes
+                    self.query_button = ctk.CTkButton(
+                        frame, text="Consultar incidentes", command=self.open_incident_query
+                    )
+                    self.query_button.pack(padx=30, pady=4, anchor="w")
                 widget = self.incidents_button
             else:
                 widget = ctk.CTkLabel(frame, text=f"{text}: {PENDING_NOTE}")
@@ -144,6 +156,14 @@ class MainView(ctk.CTk):
             return self.incident_view
         self.incident_view = IncidentView(self)
         return self.incident_view
+
+    def open_incident_query(self):
+        """Abre la consulta de incidentes; si ya está abierta, la trae al frente."""
+        if self.incident_query_view is not None and self.incident_query_view.winfo_exists():
+            self.incident_query_view.lift()
+            return self.incident_query_view
+        self.incident_query_view = IncidentQueryView(self)
+        return self.incident_query_view
 
     def logout(self):
         """Limpia la sesión y pide volver al login."""

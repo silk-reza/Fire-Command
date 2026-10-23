@@ -1,4 +1,6 @@
 import re
+from datetime import date, datetime
+from datetime import time as datetime_time
 from decimal import Decimal, InvalidOperation
 
 import mysql.connector
@@ -246,15 +248,65 @@ def _session_user_id():
     return session.get_session()["user_id"]
 
 
-def filter_incidents(type_id=None, priority_id=None, state_id=None, query=None):
-    """Búsqueda combinada; None o texto vacío significa sin filtro."""
+_DATE_FORMATS = (
+    ("%Y-%m-%d", 23, 59),
+    ("%Y-%m-%d %H:%M", None, 59),
+    ("%Y-%m-%d %H:%M:%S", None, None),
+)
+
+
+def _date_bound(value, label, is_end):
+    """Normaliza una cota; en 'hasta' completa la hora o el segundo omitidos."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip().replace("T", " ", 1)
+        if not text:
+            return None
+        for pattern, end_hour, end_second in _DATE_FORMATS:
+            try:
+                parsed = datetime.strptime(text, pattern)
+            except ValueError:
+                continue
+            if is_end:
+                # Sin hora llega a 23:59:59; con HH:MM incluye el minuto completo (:59)
+                if end_hour is not None:
+                    parsed = parsed.replace(hour=end_hour, minute=59)
+                if end_second is not None:
+                    parsed = parsed.replace(second=end_second)
+            return parsed
+    elif isinstance(value, datetime):
+        return value.replace(microsecond=0)
+    elif isinstance(value, date) and not isinstance(value, bool):
+        time_part = datetime_time(23, 59, 59) if is_end else datetime_time.min
+        return datetime.combine(value, time_part)
+    raise IncidentValidationError(
+        f"La fecha {label} no es válida. Use el formato AAAA-MM-DD."
+    )
+
+
+def filter_incidents(type_id=None, priority_id=None, state_id=None, query=None,
+                     date_from=None, date_to=None):
+    """Búsqueda combinada (AND); None o texto vacío significa sin filtro.
+
+    Un id de catálogo con formato válido pero inexistente devuelve lista vacía;
+    uno con tipo incorrecto lanza IncidentValidationError. Los catálogos inactivos
+    siguen siendo filtros válidos (consulta histórica). Las fechas filtran
+    fecha_reporte de forma inclusiva; sin hora, 'desde' es 00:00:00 y 'hasta' 23:59:59;
+    con HH:MM, 'hasta' es HH:MM:59 y 'desde' HH:MM:00.
+    """
     _require_read()
     type_id = _optional_id(type_id, "tipo de incidente")
     priority_id = _optional_id(priority_id, "prioridad")
     state_id = _optional_id(state_id, "estado")
+    start = _date_bound(date_from, "desde", is_end=False)
+    end = _date_bound(date_to, "hasta", is_end=True)
+    if start is not None and end is not None and start > end:
+        raise IncidentValidationError("La fecha desde no puede ser posterior a la fecha hasta.")
     term = query.strip() if isinstance(query, str) else ""
     try:
-        return incident_model.search_incidents(term, type_id, priority_id, state_id)
+        return incident_model.search_incidents(
+            term, type_id, priority_id, state_id, start, end)
     except mysql.connector.Error as error:
         raise _technical_error() from error
 

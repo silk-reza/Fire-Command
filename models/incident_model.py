@@ -119,8 +119,12 @@ def _escape_like(term):
     return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def search_incidents(term=None, type_id=None, priority_id=None, state_id=None):
-    """Busca por código, descripción o dirección, combinando filtros con AND."""
+def search_incidents(term=None, type_id=None, priority_id=None, state_id=None,
+                     date_from=None, date_to=None):
+    """Busca por código, descripción o dirección, combinando filtros con AND.
+
+    date_from y date_to son datetime inclusivos sobre fecha_reporte (o None).
+    """
     conditions = []
     params = []
     if term:
@@ -138,6 +142,12 @@ def search_incidents(term=None, type_id=None, priority_id=None, state_id=None):
     if state_id is not None:
         conditions.append("i.id_estado_incidente = %s")
         params.append(state_id)
+    if date_from is not None:
+        conditions.append("i.fecha_reporte >= %s")
+        params.append(date_from)
+    if date_to is not None:
+        conditions.append("i.fecha_reporte <= %s")
+        params.append(date_to)
     where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
     rows = _fetch_all(_INCIDENT_SELECT + where + _ORDER, tuple(params))
     return [_clean_incident(row) for row in rows]
