@@ -3,6 +3,7 @@ import customtkinter as ctk
 from controllers import access_controller
 from utils import permissions as perm
 from utils import session
+from views.dispatch_view import DispatchView
 from views.incident_query_view import IncidentQueryView
 from views.incident_view import IncidentView
 from views.personnel_view import PersonnelView
@@ -43,6 +44,8 @@ class MainView(ctk.CTk):
         self.incidents_button = None
         self.incident_query_view = None
         self.query_button = None
+        self.dispatch_view = None
+        self.dispatches_button = None
 
         frame = ctk.CTkFrame(self)
         frame.pack(padx=30, pady=30)
@@ -96,7 +99,15 @@ class MainView(ctk.CTk):
                         frame, text="Consultar incidentes", command=self.open_incident_query
                     )
                     self.query_button.pack(padx=30, pady=4, anchor="w")
+                if (
+                    permission == perm.PERMISSION_VIEW_OPERATIONAL_DATA
+                    or access_controller.can(perm.PERMISSION_OPERATE_DISPATCHES)
+                ):
+                    self._ensure_dispatches_button(frame)
                 widget = self.incidents_button
+            elif permission == perm.PERMISSION_OPERATE_DISPATCHES:
+                # Borradores de despacho: reemplaza la etiqueta pendiente
+                widget = self._ensure_dispatches_button(frame)
             else:
                 widget = ctk.CTkLabel(frame, text=f"{text}: {PENDING_NOTE}")
                 widget.pack(padx=30, pady=2, anchor="w")
@@ -112,6 +123,14 @@ class MainView(ctk.CTk):
         x = (self.winfo_screenwidth() - self.winfo_reqwidth()) // 2
         y = (self.winfo_screenheight() - self.winfo_reqheight()) // 3
         self.geometry(f"+{x}+{y}")
+
+    def _ensure_dispatches_button(self, frame):
+        if self.dispatches_button is None:
+            self.dispatches_button = ctk.CTkButton(
+                frame, text="Despachos (borradores)", command=self.open_dispatches
+            )
+            self.dispatches_button.pack(padx=30, pady=4, anchor="w")
+        return self.dispatches_button
 
     def open_users(self):
         """Abre el módulo de usuarios; si ya está abierto, lo trae al frente."""
@@ -164,6 +183,14 @@ class MainView(ctk.CTk):
             return self.incident_query_view
         self.incident_query_view = IncidentQueryView(self)
         return self.incident_query_view
+
+    def open_dispatches(self):
+        """Abre el módulo de despachos; si ya está abierto, lo trae al frente."""
+        if self.dispatch_view is not None and self.dispatch_view.winfo_exists():
+            self.dispatch_view.lift()
+            return self.dispatch_view
+        self.dispatch_view = DispatchView(self)
+        return self.dispatch_view
 
     def logout(self):
         """Limpia la sesión y pide volver al login."""

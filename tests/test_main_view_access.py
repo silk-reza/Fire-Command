@@ -6,6 +6,7 @@ import customtkinter as ctk
 from controllers.auth_controller import authenticate
 from utils import permissions as perm
 from utils import session
+from views.dispatch_view import DispatchView
 from views.main_view import MainView
 
 PASSWORD = "FireDemo2026!"
@@ -90,6 +91,32 @@ class MainViewAccessTest(unittest.TestCase):
             self.assertEqual(view.query_button.cget("text"), "Consultar incidentes")
             self.assertIsNot(view.query_button, view.incidents_button)
             self.assertNotIn(view.query_button, view.access_widgets.values())
+
+    def test_every_role_opens_dispatch_module(self):
+        for username in ("admin.demo", "operador.central", "consulta.sur"):
+            view = self.open_view(username)
+            button = view.dispatches_button
+            self.assertEqual(button.cget("text"), "Despachos (borradores)")
+            if perm.PERMISSION_OPERATE_DISPATCHES in view.access_widgets:
+                self.assertIs(view.access_widgets[perm.PERMISSION_OPERATE_DISPATCHES], button)
+            button.invoke()
+            view.update()
+            module = view.dispatch_view
+            self.assertIsInstance(module, DispatchView)
+            button.invoke()
+            self.assertIs(view.dispatch_view, module)
+            module.back_button.invoke()
+            view.update()
+            self.assertFalse(module.winfo_exists())
+            # El módulo de despachos ya no es una etiqueta pendiente
+            labels = [
+                w.cget("text") for w in view.winfo_children()[0].winfo_children()
+                if isinstance(w, ctk.CTkLabel)
+            ]
+            self.assertFalse([t for t in labels if t.startswith("Despachos")])
+            view.destroy()
+            self.windows.remove(view)
+            session.end_session()
 
     def test_without_session_nothing_is_offered(self):
         # Sin sesión el controlador falla cerrado y no se ofrece nada
