@@ -46,12 +46,24 @@ class DraftIncidentClosedError(DispatchStateError):
     """El borrador pertenece a un incidente cerrado o cancelado."""
 
 
+class UnitStateError(DispatchStateError):
+    """La unidad no está en el estado que exige la acción."""
+
+
+class NoActiveParticipationError(DispatchStateError):
+    """La unidad no tiene participación activa en el despacho."""
+
+
 class DispatchHasNoUnitsError(DispatchValidationError):
     """El borrador no tiene unidades preseleccionadas."""
 
 
 class UnitNotFoundError(Exception):
     """La unidad indicada no existe."""
+
+
+class DispatchUnitNotFoundError(UnitNotFoundError):
+    """La unidad no pertenece al despacho."""
 
 
 class UnitNotEligibleError(Exception):
@@ -153,7 +165,13 @@ def _domain_error(error):
         return DispatchNotFoundError("El despacho no existe.")
     if isinstance(error, dispatch_model.DispatchHasNoUnitsError):
         return DispatchHasNoUnitsError("El borrador no tiene unidades preseleccionadas.")
-    if isinstance(error, dispatch_model.IncidentDatesError):
+    if isinstance(error, dispatch_model.DispatchUnitNotFoundError):
+        return DispatchUnitNotFoundError(str(error))
+    if isinstance(error, dispatch_model.UnitStateError):
+        return UnitStateError(str(error))
+    if isinstance(error, dispatch_model.NoActiveParticipationError):
+        return NoActiveParticipationError(str(error))
+    if isinstance(error, dispatch_model.OperationDatesError):
         return DispatchValidationError(str(error))
     if isinstance(error, dispatch_model.DraftIncidentClosedError):
         return DraftIncidentClosedError(str(error))
@@ -371,3 +389,37 @@ def activate_dispatch(dispatch_id):
         raise _domain_error(error) from error
     except mysql.connector.Error as error:
         raise _technical_error() from error
+
+
+def _operate(function, dispatch_id, unit_id):
+    _require_write()
+    dispatch_id = _validate_id(dispatch_id, "despacho")
+    unit_id = _validate_id(unit_id, "unidad")
+    user_id = _session_user_id()
+    try:
+        function(dispatch_id, unit_id, user_id)
+        return _full_dispatch(dispatch_id)
+    except _MODEL_DOMAIN_ERRORS as error:
+        raise _domain_error(error) from error
+    except mysql.connector.Error as error:
+        raise _technical_error() from error
+
+
+def mark_unit_en_route(dispatch_id, unit_id):
+    """DESPACHADA -> EN_RUTA."""
+    return _operate(dispatch_model.mark_unit_en_route, dispatch_id, unit_id)
+
+
+def mark_unit_on_scene(dispatch_id, unit_id):
+    """EN_RUTA -> EN_ESCENA (la primera llegada pone el incidente EN_ATENCION)."""
+    return _operate(dispatch_model.mark_unit_on_scene, dispatch_id, unit_id)
+
+
+def start_unit_return(dispatch_id, unit_id):
+    """EN_ESCENA -> REGRESANDO (libera la participación)."""
+    return _operate(dispatch_model.start_unit_return, dispatch_id, unit_id)
+
+
+def mark_unit_available(dispatch_id, unit_id):
+    """REGRESANDO -> DISPONIBLE."""
+    return _operate(dispatch_model.mark_unit_available, dispatch_id, unit_id)

@@ -27,7 +27,7 @@ MSG_INTERNAL = "Ocurrió un problema interno. Intente de nuevo."
 MSG_NOT_FOUND = "El despacho ya no existe."
 MSG_REASON_REQUIRED = "No se canceló el borrador: el motivo es obligatorio."
 MSG_SELECT_AVAILABLE = "Seleccione una unidad de la lista de unidades disponibles."
-MSG_SELECT_DRAFT_UNIT = "Seleccione una unidad de la lista de unidades preseleccionadas."
+MSG_SELECT_DRAFT_UNIT = "Seleccione una unidad de la lista de unidades del despacho."
 MSG_NOT_DRAFT = "Este despacho ya no es un borrador y solo puede consultarse."
 READ_ONLY_TEXT = "Modo solo lectura"
 SHOW_ALL = "Todos"
@@ -46,6 +46,21 @@ COLOR_WARNING = "#d97706"
 # Solo presentación: habilita o bloquea controles; el controlador valida el estado
 DRAFT_STATE = "CREADO"
 CANCELLED_STATE = "CANCELADO"
+ACTIVE_STATE = "ACTIVO"
+COMPLETED_STATE = "COMPLETADO"
+# Solo presentación: cada estado real de la unidad habilita una única acción
+# (botón, función del controlador, texto de confirmación, mensaje de éxito,
+# estados de despacho en los que se ofrece); el controlador valida de nuevo
+UNIT_ACTIONS = {
+    "DESPACHADA": ("en_route_button", "mark_unit_en_route", "Marcar en ruta",
+                   "en ruta", (ACTIVE_STATE,)),
+    "EN_RUTA": ("on_scene_button", "mark_unit_on_scene", "Marcar en escena",
+                "en escena", (ACTIVE_STATE,)),
+    "EN_ESCENA": ("return_button", "start_unit_return", "Iniciar regreso",
+                  "con regreso iniciado", (ACTIVE_STATE,)),
+    "REGRESANDO": ("available_button", "mark_unit_available", "Marcar disponible",
+                   "disponible", (ACTIVE_STATE, COMPLETED_STATE)),
+}
 OBSERVATIONS_LIMIT = 60
 
 DISPATCH_COLUMNS = (
@@ -103,6 +118,7 @@ class DispatchView(ctk.CTkToplevel):
         self.selected_state_code = None
         self._loaded_observations = ""
         self._refreshing = False
+        self._units = {}
         # Solo presentación: texto del selector -> id
         self._incident_options = {}
         self._filter_incidents = {}
@@ -227,7 +243,9 @@ class DispatchView(ctk.CTkToplevel):
         self.observations_text = ctk.CTkTextbox(detail, width=300, height=48)
         self.observations_text.grid(row=3, column=3, sticky="w", padx=(0, 12), pady=2)
         self.hint_label = ctk.CTkLabel(detail, text="", text_color=COLOR_WARNING)
-        self.hint_label.grid(row=4, column=0, columnspan=4, sticky="w", padx=12)
+        self.hint_label.grid(row=4, column=0, columnspan=2, sticky="w", padx=12)
+        self.unit_times_label = ctk.CTkLabel(detail, text="", anchor="w")
+        self.unit_times_label.grid(row=4, column=2, columnspan=2, sticky="w", padx=12)
 
     def _build_units(self):
         container = ctk.CTkFrame(self, fg_color="transparent")
@@ -236,10 +254,20 @@ class DispatchView(ctk.CTkToplevel):
         left = ctk.CTkFrame(container)
         left.pack(side="left", fill="both", padx=(0, 6))
         ctk.CTkLabel(
-            left, text="Unidades preseleccionadas", font=ctk.CTkFont(weight="bold")
+            left, text="Unidades del despacho", font=ctk.CTkFont(weight="bold")
         ).pack(anchor="w", padx=8, pady=(4, 0))
-        self.units_tree = self._make_tree(left, DRAFT_UNIT_COLUMNS, 5)
-        self.units_tree.pack(padx=8, pady=(2, 8))
+        self.units_tree = self._make_tree(left, DRAFT_UNIT_COLUMNS, 4)
+        self.units_tree.pack(padx=8, pady=(2, 2))
+        self.units_tree.bind("<<TreeviewSelect>>", lambda event: self._update_controls())
+        actions = ctk.CTkFrame(left, fg_color="transparent")
+        actions.pack(anchor="w", padx=8, pady=(0, 6))
+        for attribute, _, label, _, _ in UNIT_ACTIONS.values():
+            button = ctk.CTkButton(
+                actions, text=label, width=118, state="disabled",
+                command=lambda name=attribute: self.run_unit_action(name),
+            )
+            button.pack(side="left", padx=(0, 4))
+            setattr(self, attribute, button)
 
         right = ctk.CTkFrame(container)
         right.pack(side="left", fill="both")
@@ -565,13 +593,18 @@ class DispatchView(ctk.CTkToplevel):
             text=f"Motivo de cancelación: {reason}" if dispatch["state_code"] == CANCELLED_STATE
             and reason else ""
         )
+        previous_unit = self.units_tree.selection()
         self.units_tree.delete(*self.units_tree.get_children())
+        self._units = {unit["unit_id"]: unit for unit in dispatch["units"]}
         for unit in dispatch["units"]:
             mark = AVAILABLE_MARK if unit["eligible_now"] else UNAVAILABLE_MARK
             self.units_tree.insert("", "end", iid=str(unit["unit_id"]), values=(
                 unit["unit_code"], unit["unit_name"] or "", unit["type_name"],
                 unit["station_name"], unit["state_name"], mark,
             ))
+        if same and previous_unit and self.units_tree.exists(previous_unit[0]):
+            self.units_tree.selection_set(previous_unit[0])
+        self.selected_state_code = dispatch["state_code"]
         self._update_controls()
 
     def _reset_form(self):
@@ -586,6 +619,7 @@ class DispatchView(ctk.CTkToplevel):
         finally:
             self._refreshing = False
         self.units_tree.delete(*self.units_tree.get_children())
+        self._units = {}
         self.form_title.configure(text="Nuevo borrador")
         self.incident_label.configure(text="")
         self.incident_state_label.configure(text="")
@@ -623,6 +657,30 @@ class DispatchView(ctk.CTkToplevel):
         for button, on in enabled.items():
             button.configure(state="normal" if on else "disabled")
         self.hint_label.configure(text=MSG_NOT_DRAFT if selected and not draft else "")
+        self._update_unit_actions()
+
+    def _selected_unit(self):
+        selection = self.units_tree.selection()
+        if not selection:
+            return None
+        return self._units.get(int(selection[0]))
+
+    def _update_unit_actions(self):
+        """Habilita solo la acción válida para el estado real de la unidad elegida."""
+        unit = self._selected_unit()
+        for attribute, _, _, _, _ in UNIT_ACTIONS.values():
+            getattr(self, attribute).configure(state="disabled")
+        if unit is None:
+            self.unit_times_label.configure(text="")
+            return
+        self.unit_times_label.configure(
+            text=f"Salida: {_format_date(unit.get('departed_at'))}  "
+                 f"Llegada: {_format_date(unit.get('arrived_at'))}  "
+                 f"Liberación: {_format_date(unit.get('released_at'))}"
+        )
+        action = UNIT_ACTIONS.get(unit["state_code"])
+        if action and self.can_write and self.selected_state_code in action[4]:
+            getattr(self, action[0]).configure(state="normal")
 
     def create(self):
         if self.selected_id is not None:
@@ -744,3 +802,23 @@ class DispatchView(ctk.CTkToplevel):
             self.refresh_list()
             self.refresh_available()
             self.show_message(f"Despacho N.º {number} activado correctamente.")
+
+    def run_unit_action(self, attribute):
+        """Ejecuta la acción operativa de la unidad seleccionada tras confirmar."""
+        unit = self._selected_unit()
+        if self.selected_id is None or unit is None:
+            self.show_message(MSG_SELECT_DRAFT_UNIT, error=True)
+            return
+        _, function_name, label, done, _ = next(
+            a for a in UNIT_ACTIONS.values() if a[0] == attribute
+        )
+        code = unit["unit_code"]
+        if not self.confirm(f"¿{label} para la unidad {code}?"):
+            return
+        function = getattr(dispatch_controller, function_name)
+        ok, dispatch = self._run(function, self.selected_id, unit["unit_id"], write=True)
+        if ok:
+            self._show_dispatch(dispatch, keep_text=True)
+            self.refresh_list()
+            self.refresh_available()
+            self.show_message(f"La unidad {code} quedó {done}.")

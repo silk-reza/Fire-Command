@@ -47,6 +47,18 @@ class UnitNotFoundError(Exception):
     """La unidad indicada no existe."""
 
 
+class UnitStateError(DispatchStateError):
+    """La unidad no está en el estado exacto que exige la transición."""
+
+
+class NoActiveParticipationError(DispatchStateError):
+    """La unidad no tiene participación activa en el despacho."""
+
+
+class DispatchUnitNotFoundError(UnitNotFoundError):
+    """La unidad no pertenece a ese despacho."""
+
+
 class UnitNotEligibleError(Exception):
     """La unidad no cumple las condiciones para preseleccionarse."""
 
@@ -67,8 +79,12 @@ class InvalidDispatchDataError(Exception):
     """Datos rechazados por validación o por una restricción CHECK."""
 
 
-class IncidentDatesError(InvalidDispatchDataError):
-    """Una restricción CHECK de fechas del incidente impidió la activación."""
+class OperationDatesError(InvalidDispatchDataError):
+    """Una restricción CHECK de fechas impidió la operación."""
+
+
+class IncidentDatesError(OperationDatesError):
+    """Una restricción CHECK de fechas del incidente impidió la operación."""
 
 
 class DispatchHasNoUnitsError(InvalidDispatchDataError):
@@ -116,12 +132,19 @@ _DRAFT_UNIT_SELECT = """
            un.activo AS unit_active,
            s.codigo AS state_code,
            s.nombre AS state_name,
-           (un.activo = 1 AND s.codigo = %s AND e.activo = 1) AS eligible_now
+           (un.activo = 1 AND s.codigo = %s AND e.activo = 1) AS eligible_now,
+           du.fecha_asignacion AS assigned_at,
+           du.fecha_salida AS departed_at,
+           du.fecha_llegada_escena AS arrived_at,
+           du.fecha_liberacion AS released_at,
+           eo.codigo AS origin_station_code,
+           eo.nombre AS origin_station_name
     FROM despacho_unidades du
     INNER JOIN unidades un ON un.id_unidad = du.id_unidad
     INNER JOIN estaciones e ON e.id_estacion = un.id_estacion
     INNER JOIN tipos_unidad t ON t.id_tipo_unidad = un.id_tipo_unidad
     INNER JOIN estados_unidad s ON s.id_estado_unidad = un.id_estado_unidad
+    LEFT JOIN estaciones eo ON eo.id_estacion = du.id_estacion_origen
     WHERE du.id_despacho = %s
     ORDER BY un.codigo, un.id_unidad
 """
@@ -714,3 +737,210 @@ def activate_dispatch(dispatch_id, user_id):
         return True
 
     return _write(operation, isolation="READ COMMITTED")
+
+
+def _audit_unit(cursor, user_id, unit_id, detail):
+    cursor.execute(
+        """
+        INSERT INTO bitacora (id_usuario, accion, entidad, id_entidad, detalle)
+        VALUES (%s, 'CAMBIO_ESTADO', 'UNIDAD', %s, %s)
+        """,
+        (user_id, unit_id, detail),
+    )
+
+
+# Columna de despacho_unidades que registra cada transición (valores internos fijos)
+_TRANSITIONS = {
+    "en_route": dict(
+        source="DESPACHADA", target="EN_RUTA", column="fecha_salida",
+        detail="DESPACHADA → EN_RUTA; salida registrada (despacho #{id}).",
+    ),
+    "on_scene": dict(
+        source="EN_RUTA", target="EN_ESCENA", column="fecha_llegada_escena",
+        detail="EN_RUTA → EN_ESCENA; llegada registrada (despacho #{id}).",
+    ),
+    "return": dict(
+        source="EN_ESCENA", target="REGRESANDO", column="fecha_liberacion",
+        detail="EN_ESCENA → REGRESANDO por liberación normal (despacho #{id}).",
+    ),
+    "available": dict(
+        source="REGRESANDO", target="DISPONIBLE", column=None,
+        detail="REGRESANDO → DISPONIBLE (despacho #{id}).",
+    ),
+}
+_ACTIVE_DISPATCH_MESSAGE = "Solo se pueden operar unidades de un despacho en estado Activo."
+_RETURN_DISPATCH_MESSAGE = (
+    "Solo se puede cerrar el regreso de unidades de un despacho Activo o Completado."
+)
+
+
+def _unit_state_id(cursor, state_code):
+    cursor.execute(
+        "SELECT id_estado_unidad FROM estados_unidad WHERE codigo = %s", (state_code,)
+    )
+    row = cursor.fetchone()
+    if row is None:
+        raise LookupError(f"Estado de unidad no encontrado: {state_code}")
+    return row["id_estado_unidad"]
+
+
+def _operate_unit(kind, dispatch_id, unit_id, user_id):
+    """Aplica una transición operativa de la unidad en una transacción corta."""
+    _require_ids(dispatch_id=dispatch_id, unit_id=unit_id, user_id=user_id)
+    step = _TRANSITIONS[kind]
+    arrival = kind == "on_scene"
+    returning_done = kind == "available"
+
+    def operation(cursor):
+        cursor.execute(
+            "SELECT id_incidente FROM despachos WHERE id_despacho = %s", (dispatch_id,)
+        )
+        head = cursor.fetchone()
+        if head is None:
+            raise DispatchNotFoundError("El despacho no existe.")
+        incident = None
+        # Orden de bloqueo: incidente (solo si puede cambiar) -> despacho -> unidad -> su
+        # participación; igual que activate_dispatch y unit_model (unidad antes que du)
+        if arrival:
+            cursor.execute(
+                """
+                SELECT i.codigo, i.fecha_inicio_atencion, s.codigo AS state_code
+                FROM incidentes i
+                INNER JOIN estados_incidente s ON s.id_estado_incidente = i.id_estado_incidente
+                WHERE i.id_incidente = %s
+                FOR UPDATE OF i
+                """,
+                (head["id_incidente"],),
+            )
+            incident = cursor.fetchone()
+        # Solo importa que el estado ACTIVO del despacho sea estable durante la transacción
+        dispatch_query = """
+            SELECT s.codigo AS state_code
+            FROM despachos d
+            INNER JOIN estados_despacho s ON s.id_estado_despacho = d.id_estado_despacho
+            WHERE d.id_despacho = %s
+            """
+        if not returning_done:
+            dispatch_query += "FOR SHARE OF d"
+        cursor.execute(dispatch_query, (dispatch_id,))
+        dispatch_state = cursor.fetchone()["state_code"]
+        if returning_done:
+            allowed = (ACTIVATED_STATE_CODE, "COMPLETADO")
+        else:
+            allowed = (ACTIVATED_STATE_CODE,)
+        if dispatch_state not in allowed:
+            raise DispatchStateError(
+                _RETURN_DISPATCH_MESSAGE if returning_done else _ACTIVE_DISPATCH_MESSAGE
+            )
+        cursor.execute(
+            """
+            SELECT u.codigo, s.codigo AS state_code, s.nombre AS state_name
+            FROM unidades u
+            INNER JOIN estados_unidad s ON s.id_estado_unidad = u.id_estado_unidad
+            WHERE u.id_unidad = %s
+            FOR UPDATE OF u
+            """,
+            (unit_id,),
+        )
+        unit = cursor.fetchone()
+        if unit is None:
+            raise UnitNotFoundError("La unidad no existe.")
+        cursor.execute(
+            """
+            SELECT id_despacho_unidad, fecha_asignacion, fecha_liberacion, fecha_cancelacion
+            FROM despacho_unidades
+            WHERE id_despacho = %s AND id_unidad = %s
+            FOR UPDATE
+            """,
+            (dispatch_id, unit_id),
+        )
+        part = cursor.fetchone()
+        if part is None:
+            raise DispatchUnitNotFoundError("La unidad no pertenece a este despacho.")
+        if returning_done:
+            if part["fecha_liberacion"] is None or part["fecha_cancelacion"] is not None:
+                raise NoActiveParticipationError(
+                    "La participación de la unidad no fue liberada en este despacho."
+                )
+        elif (part["fecha_asignacion"] is None or part["fecha_liberacion"] is not None
+              or part["fecha_cancelacion"] is not None):
+            raise NoActiveParticipationError(
+                "La unidad no tiene una participación activa en este despacho."
+            )
+        if unit["state_code"] != step["source"]:
+            raise UnitStateError(
+                f"La unidad {unit['codigo']} está en estado {unit['state_name']} "
+                f"y esta acción requiere el estado {step['source']}."
+            )
+        if arrival and incident["state_code"] not in ("ASIGNADO", "EN_ATENCION", "CONTROLADO"):
+            raise DispatchStateError(
+                "El incidente no admite la llegada de unidades en su estado actual."
+            )
+        cursor.execute("SELECT NOW() AS moment")
+        moment = cursor.fetchone()["moment"]
+        if step["column"]:
+            try:
+                cursor.execute(
+                    f"UPDATE despacho_unidades SET {step['column']} = %s "
+                    f"WHERE id_despacho_unidad = %s AND {step['column']} IS NULL",
+                    (moment, part["id_despacho_unidad"]),
+                )
+            except mysql.connector.Error as error:
+                if error.errno == 3819:
+                    raise OperationDatesError(
+                        "Las fechas de la participación no son coherentes."
+                    ) from error
+                raise
+            _expect_one_row(cursor, "participación")
+        cursor.execute(
+            "UPDATE unidades SET id_estado_unidad = %s "
+            "WHERE id_unidad = %s AND id_estado_unidad = %s",
+            (_unit_state_id(cursor, step["target"]), unit_id,
+             _unit_state_id(cursor, step["source"])),
+        )
+        _expect_one_row(cursor, "unidad")
+        _audit_unit(cursor, user_id, unit_id, step["detail"].format(id=dispatch_id))
+        if arrival and incident["state_code"] == "ASIGNADO":
+            cursor.execute(
+                "SELECT id_estado_incidente FROM estados_incidente WHERE codigo = %s",
+                ("EN_ATENCION",),
+            )
+            attention_id = cursor.fetchone()["id_estado_incidente"]
+            try:
+                cursor.execute(
+                    "UPDATE incidentes SET id_estado_incidente = %s, "
+                    "fecha_inicio_atencion = COALESCE(fecha_inicio_atencion, %s) "
+                    "WHERE id_incidente = %s",
+                    (attention_id, moment, head["id_incidente"]),
+                )
+            except mysql.connector.Error as error:
+                if error.errno == 3819:
+                    raise IncidentDatesError(
+                        "Las fechas del incidente no son coherentes con la llegada."
+                    ) from error
+                raise
+            _audit_incident(cursor, user_id, head["id_incidente"],
+                            "ASIGNADO → EN_ATENCION por primera llegada a escena.")
+        return True
+
+    return _write(operation)
+
+
+def mark_unit_en_route(dispatch_id, unit_id, user_id):
+    """DESPACHADA -> EN_RUTA con fecha_salida."""
+    return _operate_unit("en_route", dispatch_id, unit_id, user_id)
+
+
+def mark_unit_on_scene(dispatch_id, unit_id, user_id):
+    """EN_RUTA -> EN_ESCENA; la primera llegada mueve el incidente a EN_ATENCION."""
+    return _operate_unit("on_scene", dispatch_id, unit_id, user_id)
+
+
+def start_unit_return(dispatch_id, unit_id, user_id):
+    """EN_ESCENA -> REGRESANDO; libera la participación (fecha_liberacion)."""
+    return _operate_unit("return", dispatch_id, unit_id, user_id)
+
+
+def mark_unit_available(dispatch_id, unit_id, user_id):
+    """REGRESANDO -> DISPONIBLE sobre una participación ya liberada."""
+    return _operate_unit("available", dispatch_id, unit_id, user_id)

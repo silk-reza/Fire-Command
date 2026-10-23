@@ -21,12 +21,20 @@ DISPATCH_KEYS = {
 DRAFT_UNIT_KEYS = {
     "dispatch_unit_id", "unit_id", "unit_code", "unit_name", "plate", "type_name",
     "station_id", "station_code", "station_name", "station_active", "unit_active",
-    "state_code", "state_name", "eligible_now",
+    "state_code", "state_name", "eligible_now", "assigned_at", "departed_at",
+    "arrived_at", "released_at", "origin_station_code", "origin_station_name",
 }
 AVAILABLE_KEYS = {
     "unit_id", "unit_code", "unit_name", "plate", "type_id", "type_name", "station_id",
     "station_code", "station_name", "state_code", "state_name",
 }
+
+
+def function_body(source, name):
+    """Texto de una función de nivel módulo hasta la siguiente definición."""
+    start = source.index(chr(10) + "def " + name + "(")
+    end = source.find(chr(10) + "def ", start + 1)
+    return source[start:end if end != -1 else len(source)]
 
 
 class DispatchModelTest(DispatchTestBase):
@@ -616,10 +624,25 @@ class DispatchModelTest(DispatchTestBase):
         model_source = (ROOT / "models" / "dispatch_model.py").read_text(encoding="utf-8")
         controller_source = (ROOT / "controllers" / "dispatch_controller.py").read_text(
             encoding="utf-8")
-        body = re.search(r"\ndef activate_dispatch\(.*?(?=\ndef |\Z)", model_source, re.S)
-        activation = body.group(0)
-        outside = model_source.replace(activation, "")
-        # Fuera de activate_dispatch no hay escrituras sobre unidades ni incidentes
+        activation = function_body(model_source, "activate_dispatch")
+        operation = function_body(model_source, "_operate_unit")
+        outside = model_source.replace(activation, "").replace(operation, "")
+        # Solo activate_dispatch y _operate_unit (OBJ 12) escriben unidades e incidentes
+        self.assertEqual(operation.count("UPDATE unidades"), 1)
+        self.assertEqual(operation.count("UPDATE incidentes"), 1)
+        self.assertIn('if arrival and incident["state_code"] == "ASIGNADO":',
+                      operation[:operation.index("UPDATE incidentes")])
+        self.assertEqual(operation.count("UPDATE despacho_unidades"), 1)
+        for forbidden in ("UPDATE despachos", "DELETE", "INSERT INTO despachos",
+                          "INSERT INTO despacho_unidades"):
+            self.assertEqual(operation.count(forbidden), 0, forbidden)
+        # Las cuatro funciones públicas solo delegan en _operate_unit
+        for name in ("mark_unit_en_route", "mark_unit_on_scene", "start_unit_return",
+                     "mark_unit_available"):
+            public = function_body(model_source, name)
+            self.assertIn("_operate_unit(", public)
+            self.assertNotIn("UPDATE", public)
+        # Fuera de ellas no hay escrituras sobre unidades ni incidentes
         for forbidden in ("UPDATE unidades", "UPDATE incidentes"):
             self.assertEqual(outside.count(forbidden), 0, forbidden)
         # Las constantes de activación solo aparecen en su definición
@@ -636,7 +659,7 @@ class DispatchModelTest(DispatchTestBase):
         self.assertEqual(activation.count("SET id_estado_despacho"), 1)
         self.assertEqual(activation.count("INSERT INTO"), 0)
         self.assertEqual(sorted(re.findall(r"INSERT INTO (\w+)", model_source)),
-                         ["bitacora", "bitacora", "despacho_unidades", "despachos"])
+                         ["bitacora", "bitacora", "bitacora", "despacho_unidades", "despachos"])
         # Único INSERT en despachos usa el estado CREADO
         self.assertEqual(outside.count("_state_id_by_code(cursor, DRAFT_STATE_CODE)"), 1)
         # En la activación solo sirve como guarda del UPDATE (estado de origen)

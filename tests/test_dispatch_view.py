@@ -24,9 +24,11 @@ UNIT_TITLES = ["Código", "Nombre", "Tipo", "Estación", "Estado real", "Disponi
 AVAILABLE_TITLES = ["Código", "Nombre", "Tipo", "Estación", "Estado"]
 BUTTONS = {
     "Nuevo borrador", "Guardar cambios", "Agregar unidad", "Quitar unidad",
-    "Cancelar borrador", "Activar despacho", "Refrescar", "Limpiar selección", "Regresar",
+    "Cancelar borrador", "Activar despacho", "Refrescar", "Marcar en ruta",
+    "Marcar en escena", "Iniciar regreso", "Marcar disponible", "Limpiar selección", "Regresar",
     "Quitar filtros", "Buscar", "Limpiar filtros",
 }
+ACTION_BUTTONS = ("en_route_button", "on_scene_button", "return_button", "available_button")
 WRITE_BUTTONS = (
     "create_button", "save_button", "add_button", "remove_button", "cancel_button",
     "activate_button",
@@ -513,6 +515,157 @@ class DispatchViewTest(DispatchTestBase):
         self.assertNotIn("SELECT", text)
         self.assertEqual(self.dispatch_state(draft), "CREADO")
 
+    def active_dispatch(self, suffix="A"):
+        """Despacho ACTIVO temporal creado y activado por el controlador."""
+        _login("operador.central")
+        incident_id = self.insert_incident(suffix)
+        unit_id = self.temp_unit()
+        draft = dispatch_controller.create_dispatch_draft({"incident_id": incident_id})
+        dispatch_id = draft["dispatch_id"]
+        dispatch_controller.add_unit_to_draft(dispatch_id, unit_id)
+        dispatch_controller.activate_dispatch(dispatch_id)
+        return incident_id, unit_id, dispatch_id
+
+    def open_unit(self, view, dispatch_id, unit_id):
+        view.refresh_all()
+        self.select_dispatch(view, dispatch_id)
+        view.units_tree.selection_set(str(unit_id))
+        view.update()
+
+    def enabled_actions(self, view):
+        return [n for n in ACTION_BUTTONS if self.state(getattr(view, n)) == "normal"]
+
+    def test_unit_action_enablement_matrix(self):
+        incident_id, unit_id, dispatch_id = self.active_dispatch("A")
+        view = self.open_view("operador.central")
+        self.open_unit(view, dispatch_id, unit_id)
+        self.assertEqual(self.enabled_actions(view), ["en_route_button"])
+        expected = {
+            "DESPACHADA": ["en_route_button"], "EN_RUTA": ["on_scene_button"],
+            "EN_ESCENA": ["return_button"], "REGRESANDO": ["available_button"],
+            "DISPONIBLE": [],
+        }
+        for state_code, buttons in expected.items():
+            self.set_unit_state(unit_id, state_code)
+            self.open_unit(view, dispatch_id, unit_id)
+            self.assertEqual(self.enabled_actions(view), buttons, state_code)
+        # Sin unidad seleccionada no hay acciones
+        view.units_tree.selection_remove(*view.units_tree.selection())
+        view.update()
+        self.assertEqual(self.enabled_actions(view), [])
+        self.assertEqual(view.unit_times_label.cget("text"), "")
+
+        # Despacho completado: solo la liberación de una unidad que regresa
+        done_incident = self.insert_incident("B")
+        done = self.add_dispatch(done_incident, "COMPLETADO")
+        done_unit = self.temp_unit()
+        self.add_assigned_participation(done, done_unit)
+        for state_code, buttons in (("EN_RUTA", []), ("REGRESANDO", ["available_button"])):
+            self.set_unit_state(done_unit, state_code)
+            self.open_unit(view, done, done_unit)
+            self.assertEqual(self.enabled_actions(view), buttons, state_code)
+
+        # Borrador y cancelado: nunca hay acciones aunque el estado de la unidad las permita
+        for suffix, state_code in (("C", "CREADO"), ("D", "CANCELADO")):
+            other = self.insert_incident(suffix)
+            dispatch = self.add_dispatch(other, state_code)
+            unit = self.temp_unit(state_code="REGRESANDO")
+            self.add_preselection(dispatch, unit)
+            self.open_unit(view, dispatch, unit)
+            self.assertEqual(self.enabled_actions(view), [], state_code)
+
+    def test_unit_action_full_flow(self):
+        incident_id, unit_id, dispatch_id = self.active_dispatch("A")
+        view = self.open_view("operador.central")
+        self.open_unit(view, dispatch_id, unit_id)
+        self.assertEqual(self.state_of(incident_id), "ASIGNADO")
+        steps = (
+            ("en_route_button", "EN_RUTA", "on_scene_button", "Salida: 20"),
+            ("on_scene_button", "EN_ESCENA", "return_button", "Llegada: 20"),
+            ("return_button", "REGRESANDO", "available_button", "Llegada: 20"),
+            ("available_button", "DISPONIBLE", None, "Liberación: 20"),
+        )
+        for clicked, new_state, next_button, times in steps:
+            self.assertEqual(self.enabled_actions(view), [clicked])
+            with mock.patch.object(view, "confirm", return_value=True) as confirm:
+                getattr(view, clicked).invoke()
+            view.update()
+            self.assertIn(self.unit_code(1), confirm.call_args[0][0])
+            self.assertIn(self.unit_code(1), view.message_label.cget("text"))
+            self.assertEqual(self.unit_state(unit_id), new_state)
+            self.assertEqual(view.units_tree.selection(), (str(unit_id),))
+            self.assertEqual(
+                view.units_tree.item(str(unit_id), "values")[4], self.unit_state_name(new_state))
+            self.assertIn(times, view.unit_times_label.cget("text"))
+            self.assertEqual(
+                self.enabled_actions(view), [next_button] if next_button else [])
+            self.assertEqual(view.selected_id, dispatch_id)
+        self.assertIn("atención", view.incident_state_label.cget("text"))
+        self.assertNotEqual(self.state_of(incident_id), "ASIGNADO")
+        self.assertIn("Liberación: 20", view.unit_times_label.cget("text"))
+        for name in ("save_button", "add_button", "remove_button", "cancel_button",
+                     "activate_button"):
+            self.assertEqual(self.state(getattr(view, name)), "disabled", name)
+
+    def test_unit_action_confirm_false_changes_nothing(self):
+        incident_id, unit_id, dispatch_id = self.active_dispatch("A")
+        view = self.open_view("operador.central")
+        self.open_unit(view, dispatch_id, unit_id)
+        before = (self.preselections(dispatch_id), self.unit_row(unit_id),
+                  self.row(incident_id))
+        with mock.patch.object(view, "confirm", return_value=False):
+            view.en_route_button.invoke()
+        self.assertEqual((self.preselections(dispatch_id), self.unit_row(unit_id),
+                          self.row(incident_id)), before)
+        self.assertEqual(self.enabled_actions(view), ["en_route_button"])
+
+    def test_unit_action_read_only_user(self):
+        incident_id, unit_id, dispatch_id = self.active_dispatch("A")
+        session.end_session()
+        view = self.open_view("consulta.sur")
+        self.open_unit(view, dispatch_id, unit_id)
+        self.assertEqual(self.enabled_actions(view), [])
+        before = (self.preselections(dispatch_id), self.unit_row(unit_id),
+                  self.row(incident_id))
+        view.en_route_button.configure(state="normal")
+        with mock.patch.object(view, "confirm", return_value=True):
+            view.run_unit_action("en_route_button")
+        self.assertEqual(view.message_label.cget("text"), MSG_DENIED_WRITE)
+        self.assertEqual((self.preselections(dispatch_id), self.unit_row(unit_id),
+                          self.row(incident_id)), before)
+
+    def test_unit_action_with_stale_state_reloads(self):
+        incident_id, unit_id, dispatch_id = self.active_dispatch("A")
+        view = self.open_view("operador.central")
+        self.open_unit(view, dispatch_id, unit_id)
+        self.set_unit_state(unit_id, "EN_ESCENA")
+        before = (self.preselections(dispatch_id), self.unit_row(unit_id),
+                  self.row(incident_id))
+        with mock.patch.object(view, "confirm", return_value=True):
+            view.en_route_button.invoke()
+        view.update()
+        text = view.message_label.cget("text")
+        self.assertNotEqual(text, "")
+        self.assertNotEqual(text, MSG_INTERNAL)
+        self.assertEqual((self.preselections(dispatch_id), self.unit_row(unit_id),
+                          self.row(incident_id)), before)
+        self.assertEqual(self.enabled_actions(view), ["return_button"])
+
+    def test_unit_action_service_error_is_generic(self):
+        incident_id, unit_id, dispatch_id = self.active_dispatch("A")
+        view = self.open_view("operador.central")
+        self.open_unit(view, dispatch_id, unit_id)
+        error = DispatchServiceError("SELECT * FROM unidades Traceback")
+        with mock.patch.object(dispatch_controller, "mark_unit_en_route", side_effect=error), \
+                mock.patch.object(view, "confirm", return_value=True), \
+                self.assertLogs("views.dispatch_view", level="ERROR"):
+            view.en_route_button.invoke()
+        text = view.message_label.cget("text")
+        self.assertEqual(text, MSG_INTERNAL)
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("SELECT", text)
+        self.assertEqual(self.unit_state(unit_id), "DESPACHADA")
+
     def test_refresh_keeps_selection_filters_and_typed_text(self):
         self.insert_incident("A")
         self.temp_unit(name="Alfa")
@@ -685,7 +838,7 @@ class DispatchViewTest(DispatchTestBase):
         walk(view)
         self.assertEqual(texts, BUTTONS)
         self.assertEqual(SOURCE.count('text="Activar despacho"'), 1)
-        for forbidden in ("EN_RUTA", "EN_ESCENA", "Liberar", "tripulaci", "Eliminar"):
+        for forbidden in ("Liberar", "tripulaci", "Falla", "Mantenimiento", "Eliminar", "Completar"):
             self.assertNotIn(forbidden, SOURCE)
 
     def test_source_has_no_data_access_or_role_names(self):
