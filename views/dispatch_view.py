@@ -6,6 +6,7 @@ import customtkinter as ctk
 from controllers import dispatch_controller, access_controller
 from controllers.access_controller import AuthorizationDenied, NotAuthenticated
 from controllers.dispatch_controller import (
+    DispatchHasNoUnitsError,
     DispatchIncidentNotFoundError,
     DispatchNotFoundError,
     DispatchStateError,
@@ -279,36 +280,40 @@ class DispatchView(ctk.CTkToplevel):
         bar = ctk.CTkFrame(self, fg_color="transparent")
         bar.pack(padx=16, pady=(2, 8))
         self.create_button = ctk.CTkButton(
-            bar, text="Nuevo borrador", width=120, command=self.create
+            bar, text="Nuevo borrador", width=110, command=self.create
         )
         self.save_button = ctk.CTkButton(
-            bar, text="Guardar cambios", width=120, command=self.save
+            bar, text="Guardar cambios", width=110, command=self.save
         )
         self.add_button = ctk.CTkButton(
-            bar, text="Agregar unidad", width=120, command=self.add_unit
+            bar, text="Agregar unidad", width=110, command=self.add_unit
         )
         self.remove_button = ctk.CTkButton(
-            bar, text="Quitar unidad", width=110, command=self.remove_unit
+            bar, text="Quitar unidad", width=100, command=self.remove_unit
         )
         self.cancel_button = ctk.CTkButton(
-            bar, text="Cancelar borrador", width=130, fg_color="#b45309",
+            bar, text="Cancelar borrador", width=125, fg_color="#b45309",
             hover_color="#92400e", command=self.cancel_draft,
         )
+        self.activate_button = ctk.CTkButton(
+            bar, text="Activar despacho", width=115, fg_color="#2e7d32",
+            hover_color="#1b5e20", command=self.activate,
+        )
         self.refresh_button = ctk.CTkButton(
-            bar, text="Refrescar", width=90, fg_color="gray40", hover_color="gray30",
+            bar, text="Refrescar", width=80, fg_color="gray40", hover_color="gray30",
             command=self.refresh_all,
         )
         self.clear_button = ctk.CTkButton(
-            bar, text="Limpiar selección", width=120, fg_color="gray40",
+            bar, text="Limpiar selección", width=115, fg_color="gray40",
             hover_color="gray30", command=self.clear_form,
         )
         self.back_button = ctk.CTkButton(
-            bar, text="Regresar", width=90, fg_color="gray40", hover_color="gray30",
+            bar, text="Regresar", width=80, fg_color="gray40", hover_color="gray30",
             command=self.close,
         )
         for button in (
             self.create_button, self.save_button, self.add_button, self.remove_button,
-            self.cancel_button, self.refresh_button, self.clear_button, self.back_button,
+            self.cancel_button, self.activate_button, self.refresh_button, self.clear_button, self.back_button,
         ):
             button.pack(side="left", padx=3)
 
@@ -357,12 +362,13 @@ class DispatchView(ctk.CTkToplevel):
             self.load_incident_options()
         except (
             DispatchStateError, UnitNotEligibleError, DuplicateDraftUnitError,
-            DraftUnitNotFoundError, UnitNotFoundError,
+            DraftUnitNotFoundError, UnitNotFoundError, DispatchHasNoUnitsError,
+            IncidentTerminalError,
         ) as error:
             self.show_message(str(error), error=True)
             # Los datos en pantalla pudieron quedar desactualizados
             self._reload_after_conflict()
-        except (DispatchValidationError, IncidentTerminalError) as error:
+        except DispatchValidationError as error:
             self.show_message(str(error), error=True)
         except (AuthorizationDenied, NotAuthenticated):
             self.show_message(MSG_DENIED_WRITE if write else MSG_DENIED_READ, error=True)
@@ -610,6 +616,9 @@ class DispatchView(ctk.CTkToplevel):
             self.add_button: self.can_write and draft,
             self.remove_button: self.can_write and draft,
             self.cancel_button: self.can_write and draft,
+            self.activate_button: (
+                self.can_write and draft and bool(self.units_tree.get_children())
+            ),
         }
         for button, on in enabled.items():
             button.configure(state="normal" if on else "disabled")
@@ -717,3 +726,21 @@ class DispatchView(ctk.CTkToplevel):
             # Si el filtro ya no incluye el borrador, se vuelve al modo nuevo
             if not self.tree.exists(str(number)):
                 self._reset_form()
+
+    def activate(self):
+        if not self._is_draft() or not self.units_tree.get_children():
+            return
+        number = self.selected_id
+        message = (
+            f"¿Activar el despacho N.º {number}? Las unidades pasarán a Despachada y, "
+            "si el incidente está Reportado, pasará a Asignado. Esta acción no se "
+            "puede deshacer desde esta pantalla."
+        )
+        if not self.confirm(message):
+            return
+        ok, dispatch = self._run(dispatch_controller.activate_dispatch, number, write=True)
+        if ok:
+            self._show_dispatch(dispatch)
+            self.refresh_list()
+            self.refresh_available()
+            self.show_message(f"Despacho N.º {number} activado correctamente.")

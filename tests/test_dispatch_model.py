@@ -612,24 +612,41 @@ class DispatchModelTest(DispatchTestBase):
         self.assertEqual(self.preselections(dispatch_id), [])
 
     # Revisión del código fuente: sin activación ni estados arbitrarios
-    def test_source_has_no_activation(self):
+    def test_source_state_changes_are_restricted(self):
         model_source = (ROOT / "models" / "dispatch_model.py").read_text(encoding="utf-8")
         controller_source = (ROOT / "controllers" / "dispatch_controller.py").read_text(
             encoding="utf-8")
-        for source in (model_source, controller_source):
-            self.assertNotIn("ACTIVO", source)
-            self.assertNotIn("activate", source.lower())
-            self.assertNotIn("UPDATE unidades", source)
-            self.assertNotIn("UPDATE incidentes", source)
+        body = re.search(r"\ndef activate_dispatch\(.*?(?=\ndef |\Z)", model_source, re.S)
+        activation = body.group(0)
+        outside = model_source.replace(activation, "")
+        # Fuera de activate_dispatch no hay escrituras sobre unidades ni incidentes
+        for forbidden in ("UPDATE unidades", "UPDATE incidentes"):
+            self.assertEqual(outside.count(forbidden), 0, forbidden)
+        # Las constantes de activación solo aparecen en su definición
+        for constant in ("ACTIVATED_STATE_CODE", "DISPATCHED_UNIT_STATE_CODE",
+                         "INCIDENT_ASSIGNED_CODE"):
+            self.assertEqual(outside.count(constant), 1, constant)
+        # Solo queda la definición de la constante con el literal ACTIVO
+        self.assertEqual(outside.count('"ACTIVO"'), 1)
+        self.assertNotIn("ACTIVO", controller_source)
+        self.assertEqual(activation.count("UPDATE unidades"), 1)
+        self.assertIn("SET id_estado_unidad = %s ", activation)
+        self.assertEqual(activation.count("UPDATE incidentes"), 1)
+        self.assertEqual(activation.count("_state_id_by_code(cursor, ACTIVATED_STATE_CODE)"), 1)
+        self.assertEqual(activation.count("SET id_estado_despacho"), 1)
+        self.assertEqual(activation.count("INSERT INTO"), 0)
         self.assertEqual(sorted(re.findall(r"INSERT INTO (\w+)", model_source)),
-                         ["bitacora", "despacho_unidades", "despachos"])
+                         ["bitacora", "bitacora", "despacho_unidades", "despachos"])
         # Único INSERT en despachos usa el estado CREADO
-        self.assertEqual(model_source.count("_state_id_by_code(cursor, DRAFT_STATE_CODE)"), 1)
-        # Único UPDATE del estado usa CANCELADO
-        self.assertEqual(model_source.count("SET id_estado_despacho"), 1)
+        self.assertEqual(outside.count("_state_id_by_code(cursor, DRAFT_STATE_CODE)"), 1)
+        # En la activación solo sirve como guarda del UPDATE (estado de origen)
+        self.assertEqual(activation.count("_state_id_by_code(cursor, DRAFT_STATE_CODE)"), 1)
+        self.assertIn("AND id_estado_despacho = %s", activation)
+        # Estados de despacho: CANCELADO en el borrador y ACTIVO solo al activar
+        self.assertEqual(model_source.count("SET id_estado_despacho"), 2)
         self.assertEqual(model_source.count("_state_id_by_code(cursor, CANCELLED_STATE_CODE)"), 1)
-        self.assertEqual(model_source.count("UPDATE despachos"), 2)
-        self.assertEqual(len(re.findall(r"\bDELETE\b", model_source)), 1)
+        self.assertEqual(model_source.count("UPDATE despachos"), 3)
+        self.assertEqual(model_source.count("DELETE"), 1)
         delete_block = model_source[model_source.index("DELETE du FROM"):]
         delete_block = delete_block[:delete_block.index('"""')]
         self.assertIn("du.fecha_asignacion IS NULL", delete_block)

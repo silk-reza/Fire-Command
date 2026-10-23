@@ -46,6 +46,10 @@ class DraftIncidentClosedError(DispatchStateError):
     """El borrador pertenece a un incidente cerrado o cancelado."""
 
 
+class DispatchHasNoUnitsError(DispatchValidationError):
+    """El borrador no tiene unidades preseleccionadas."""
+
+
 class UnitNotFoundError(Exception):
     """La unidad indicada no existe."""
 
@@ -144,11 +148,13 @@ def _domain_error(error):
     if isinstance(error, dispatch_model.DispatchIncidentNotFoundError):
         return DispatchIncidentNotFoundError("El incidente no existe.")
     if isinstance(error, dispatch_model.IncidentTerminalError):
-        return IncidentTerminalError(
-            "No se puede crear un despacho para un incidente cerrado o cancelado."
-        )
+        return IncidentTerminalError(str(error))
     if isinstance(error, dispatch_model.DispatchNotFoundError):
         return DispatchNotFoundError("El despacho no existe.")
+    if isinstance(error, dispatch_model.DispatchHasNoUnitsError):
+        return DispatchHasNoUnitsError("El borrador no tiene unidades preseleccionadas.")
+    if isinstance(error, dispatch_model.IncidentDatesError):
+        return DispatchValidationError(str(error))
     if isinstance(error, dispatch_model.DraftIncidentClosedError):
         return DraftIncidentClosedError(str(error))
     if isinstance(error, dispatch_model.DispatchStateError):
@@ -344,6 +350,21 @@ def cancel_dispatch_draft(dispatch_id, reason):
     user_id = _session_user_id()
     try:
         if not dispatch_model.cancel_dispatch_draft(dispatch_id, reason, user_id):
+            raise DispatchNotFoundError("El despacho no existe.")
+        return _full_dispatch(dispatch_id)
+    except _MODEL_DOMAIN_ERRORS as error:
+        raise _domain_error(error) from error
+    except mysql.connector.Error as error:
+        raise _technical_error() from error
+
+
+def activate_dispatch(dispatch_id):
+    """Activa un borrador CREADO: unidades DESPACHADA e incidente ASIGNADO si estaba REPORTADO."""
+    _require_write()
+    dispatch_id = _validate_id(dispatch_id, "despacho")
+    user_id = _session_user_id()
+    try:
+        if not dispatch_model.activate_dispatch(dispatch_id, user_id):
             raise DispatchNotFoundError("El despacho no existe.")
         return _full_dispatch(dispatch_id)
     except _MODEL_DOMAIN_ERRORS as error:

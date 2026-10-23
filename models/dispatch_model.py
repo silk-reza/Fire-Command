@@ -3,9 +3,14 @@ import re
 import mysql.connector
 
 from config.database import get_connection
+from models import unit_model
 
 DRAFT_STATE_CODE = "CREADO"
 CANCELLED_STATE_CODE = "CANCELADO"
+ACTIVATED_STATE_CODE = "ACTIVO"
+DISPATCHED_UNIT_STATE_CODE = "DESPACHADA"
+INCIDENT_REPORTED_CODE = "REPORTADO"
+INCIDENT_ASSIGNED_CODE = "ASIGNADO"
 AVAILABLE_UNIT_STATE_CODE = "DISPONIBLE"
 # Estados de incidente que no admiten nuevos despachos
 TERMINAL_INCIDENT_CODES = ("CERRADO", "CANCELADO")
@@ -60,6 +65,14 @@ class InvalidReferenceError(Exception):
 
 class InvalidDispatchDataError(Exception):
     """Datos rechazados por validación o por una restricción CHECK."""
+
+
+class IncidentDatesError(InvalidDispatchDataError):
+    """Una restricción CHECK de fechas del incidente impidió la activación."""
+
+
+class DispatchHasNoUnitsError(InvalidDispatchDataError):
+    """El borrador no tiene unidades preseleccionadas."""
 
 
 _DISPATCH_SELECT = """
@@ -249,12 +262,17 @@ def _translate_error(error):
     return None
 
 
-def _write(operation):
-    """Ejecuta operation(cursor) en su propia transacción."""
+def _write(operation, isolation=None):
+    """Ejecuta operation(cursor) en su propia transacción.
+
+    isolation (opcional) fija el nivel solo para esta transacción.
+    """
     connection = get_connection()
     try:
         cursor = connection.cursor(dictionary=True)
         try:
+            if isolation:
+                connection.start_transaction(isolation_level=isolation)
             result = operation(cursor)
             connection.commit()
             return result
@@ -523,3 +541,176 @@ def cancel_dispatch_draft(dispatch_id, reason, user_id):
         return True
 
     return _write(operation)
+
+
+def _expect_one_row(cursor, label):
+    """Fuerza el rollback si un UPDATE de la activación no cambió exactamente una fila."""
+    if cursor.rowcount != 1:
+        raise RuntimeError(f"La activación no pudo actualizar la fila de {label}.")
+
+
+def _audit_incident(cursor, user_id, incident_id, detail):
+    cursor.execute(
+        """
+        INSERT INTO bitacora (id_usuario, accion, entidad, id_entidad, detalle)
+        VALUES (%s, 'CAMBIO_ESTADO', 'INCIDENTE', %s, %s)
+        """,
+        (user_id, incident_id, detail),
+    )
+
+
+def _unit_activation_problem(cursor, unit):
+    """Motivo por el que la unidad no puede activarse, o None si está lista."""
+    if not unit["activo"]:
+        return "está inactiva"
+    if unit["state_code"] != AVAILABLE_UNIT_STATE_CODE:
+        return f"no está disponible (estado {unit['state_name']})"
+    if not unit["station_active"]:
+        return "pertenece a una estación inactiva"
+    if unit_model._has_active_participation(cursor, unit["id_unidad"]):
+        return "tiene una participación activa en otro despacho"
+    return None
+
+
+def activate_dispatch(dispatch_id, user_id):
+    """Activa un despacho CREADO en una sola transacción; False si no existe."""
+    _require_ids(dispatch_id=dispatch_id, user_id=user_id)
+
+    def operation(cursor):
+        cursor.execute(
+            "SELECT id_incidente FROM despachos WHERE id_despacho = %s", (dispatch_id,)
+        )
+        head = cursor.fetchone()
+        if head is None:
+            return False
+        incident_id = head["id_incidente"]
+        # Orden de bloqueo: incidente -> despacho -> unidades (por id) -> sus despacho_unidades.
+        # Se ejecuta en READ COMMITTED: sin bloqueos de hueco en despacho_unidades (que
+        # chocarían con add_unit_to_draft de otro despacho) y con lecturas siempre frescas.
+        cursor.execute(
+            """
+            SELECT i.id_incidente, i.codigo, i.fecha_asignacion, s.codigo AS state_code
+            FROM incidentes i
+            INNER JOIN estados_incidente s ON s.id_estado_incidente = i.id_estado_incidente
+            WHERE i.id_incidente = %s
+            FOR UPDATE OF i
+            """,
+            (incident_id,),
+        )
+        incident = cursor.fetchone()
+        if incident["state_code"] in TERMINAL_INCIDENT_CODES:
+            raise IncidentTerminalError(
+                "No se puede activar un despacho de un incidente cerrado o cancelado."
+            )
+        cursor.execute(
+            """
+            SELECT s.codigo AS state_code
+            FROM despachos d
+            INNER JOIN estados_despacho s ON s.id_estado_despacho = d.id_estado_despacho
+            WHERE d.id_despacho = %s
+            FOR UPDATE OF d
+            """,
+            (dispatch_id,),
+        )
+        if cursor.fetchone()["state_code"] != DRAFT_STATE_CODE:
+            raise DispatchStateError("Solo se puede activar un despacho en estado Creado.")
+        # Lectura simple: el bloqueo del despacho ya congela sus preselecciones
+        cursor.execute(
+            "SELECT id_unidad FROM despacho_unidades WHERE id_despacho = %s "
+            "ORDER BY id_unidad",
+            (dispatch_id,),
+        )
+        unit_ids = [row["id_unidad"] for row in cursor.fetchall()]
+        if not unit_ids:
+            raise DispatchHasNoUnitsError("El borrador no tiene unidades preseleccionadas.")
+        placeholders = ", ".join(["%s"] * len(unit_ids))
+        cursor.execute(
+            f"""
+            SELECT u.id_unidad, u.codigo, u.activo, u.id_estacion,
+                   s.codigo AS state_code, s.nombre AS state_name,
+                   e.activo AS station_active
+            FROM unidades u
+            INNER JOIN estados_unidad s ON s.id_estado_unidad = u.id_estado_unidad
+            INNER JOIN estaciones e ON e.id_estacion = u.id_estacion
+            WHERE u.id_unidad IN ({placeholders})
+            ORDER BY u.id_unidad
+            FOR UPDATE OF u
+            """,
+            tuple(unit_ids),
+        )
+        units = cursor.fetchall()
+        if len(units) != len(unit_ids):
+            raise UnitNotFoundError("Una unidad preseleccionada ya no existe.")
+        cursor.execute(
+            "SELECT id_despacho_unidad, id_unidad FROM despacho_unidades "
+            "WHERE id_despacho = %s ORDER BY id_unidad FOR UPDATE",
+            (dispatch_id,),
+        )
+        participations = {row["id_unidad"]: row["id_despacho_unidad"]
+                          for row in cursor.fetchall()}
+        # Todo o nada: la primera unidad inválida (por id) aborta la activación
+        for unit in units:
+            problem = _unit_activation_problem(cursor, unit)
+            if problem:
+                raise UnitNotEligibleError(f"La unidad {unit['codigo']} {problem}.")
+        cursor.execute("SELECT NOW() AS moment")
+        moment = cursor.fetchone()["moment"]
+        active_id = _state_id_by_code(cursor, ACTIVATED_STATE_CODE)
+        draft_id = _state_id_by_code(cursor, DRAFT_STATE_CODE)
+        cursor.execute(
+            "UPDATE despachos SET id_estado_despacho = %s, fecha_despacho = %s "
+            "WHERE id_despacho = %s AND id_estado_despacho = %s",
+            (active_id, moment, dispatch_id, draft_id),
+        )
+        _expect_one_row(cursor, "despacho")
+        cursor.execute(
+            "SELECT id_estado_unidad FROM estados_unidad WHERE codigo = %s",
+            (DISPATCHED_UNIT_STATE_CODE,),
+        )
+        dispatched_id = cursor.fetchone()["id_estado_unidad"]
+        cursor.execute(
+            "SELECT id_estado_unidad FROM estados_unidad WHERE codigo = %s",
+            (AVAILABLE_UNIT_STATE_CODE,),
+        )
+        available_id = cursor.fetchone()["id_estado_unidad"]
+        for unit in units:
+            # Estación de origen congelada: la actual de la unidad bajo lock
+            cursor.execute(
+                "UPDATE despacho_unidades SET fecha_asignacion = %s, id_estacion_origen = %s "
+                "WHERE id_despacho_unidad = %s AND fecha_asignacion IS NULL",
+                (moment, unit["id_estacion"], participations[unit["id_unidad"]]),
+            )
+            _expect_one_row(cursor, "participación")
+            cursor.execute(
+                "UPDATE unidades SET id_estado_unidad = %s "
+                "WHERE id_unidad = %s AND id_estado_unidad = %s",
+                (dispatched_id, unit["id_unidad"], available_id),
+            )
+            _expect_one_row(cursor, "unidad")
+        moved_incident = incident["state_code"] == INCIDENT_REPORTED_CODE
+        if moved_incident:
+            cursor.execute(
+                "SELECT id_estado_incidente FROM estados_incidente WHERE codigo = %s",
+                (INCIDENT_ASSIGNED_CODE,),
+            )
+            assigned_id = cursor.fetchone()["id_estado_incidente"]
+            try:
+                cursor.execute(
+                    "UPDATE incidentes SET id_estado_incidente = %s, "
+                    "fecha_asignacion = COALESCE(fecha_asignacion, %s) WHERE id_incidente = %s",
+                    (assigned_id, moment, incident_id),
+                )
+            except mysql.connector.Error as error:
+                if error.errno == 3819:
+                    raise IncidentDatesError(
+                        "Las fechas del incidente no son coherentes con la activación."
+                    ) from error
+                raise
+        _audit(cursor, user_id, "CAMBIO_ESTADO", dispatch_id,
+               f"CREADO → ACTIVO para {incident['codigo']}.")
+        if moved_incident:
+            _audit_incident(cursor, user_id, incident_id,
+                            f"REPORTADO → ASIGNADO por activación del despacho #{dispatch_id}.")
+        return True
+
+    return _write(operation, isolation="READ COMMITTED")

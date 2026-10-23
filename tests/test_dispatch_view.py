@@ -24,10 +24,13 @@ UNIT_TITLES = ["Código", "Nombre", "Tipo", "Estación", "Estado real", "Disponi
 AVAILABLE_TITLES = ["Código", "Nombre", "Tipo", "Estación", "Estado"]
 BUTTONS = {
     "Nuevo borrador", "Guardar cambios", "Agregar unidad", "Quitar unidad",
-    "Cancelar borrador", "Refrescar", "Limpiar selección", "Regresar",
+    "Cancelar borrador", "Activar despacho", "Refrescar", "Limpiar selección", "Regresar",
     "Quitar filtros", "Buscar", "Limpiar filtros",
 }
-WRITE_BUTTONS = ("create_button", "save_button", "add_button", "remove_button", "cancel_button")
+WRITE_BUTTONS = (
+    "create_button", "save_button", "add_button", "remove_button", "cancel_button",
+    "activate_button",
+)
 
 
 def _login(username):
@@ -428,6 +431,88 @@ class DispatchViewTest(DispatchTestBase):
         self.assertEqual(view.tree.selection(), ())
         self.assertEqual(self.state(view.create_button), "normal")
 
+    def draft_with_unit(self, view, suffix="A"):
+        incident_id = self.insert_incident(suffix)
+        unit_id = self.temp_unit()
+        draft = self.new_draft(view, suffix)
+        self.pick_available(view, unit_id)
+        view.add_button.invoke()
+        view.update()
+        return incident_id, unit_id, draft
+
+    def test_activation_flow(self):
+        view = self.open_view("operador.central")
+        incident_id, unit_id, draft = self.draft_with_unit(view)
+        self.assertEqual(self.state(view.activate_button), "normal")
+        with mock.patch.object(view, "confirm", return_value=False) as confirm:
+            view.activate_button.invoke()
+        self.assertIn("no se puede deshacer", confirm.call_args[0][0])
+        self.assertEqual(self.dispatch_state(draft), "CREADO")
+        self.assertEqual(self.unit_state(unit_id), "DISPONIBLE")
+        self.assertEqual(self.state_of(incident_id), "REPORTADO")
+        with mock.patch.object(view, "confirm", return_value=True):
+            view.activate_button.invoke()
+        view.update()
+        self.assertIn("activado correctamente", view.message_label.cget("text"))
+        self.assertEqual(self.dispatch_state(draft), "ACTIVO")
+        self.assertEqual(self.unit_state(unit_id), "DESPACHADA")
+        self.assertEqual(self.state_of(incident_id), "ASIGNADO")
+        self.assertIn("Activo", view.state_label.cget("text"))
+        self.assertEqual(view.tree.item(str(draft), "values")[2], "Activo")
+        self.assertEqual(view.tree.selection(), (str(draft),))
+        mark = view.units_tree.item(str(unit_id), "values")
+        self.assertEqual(mark[4], self.unit_state_name("DESPACHADA"))
+        self.assertNotIn(self.unit_code(1), self.unit_codes(view.available_tree))
+        for name in WRITE_BUTTONS:
+            self.assertEqual(self.state(getattr(view, name)), "disabled", name)
+        self.assertEqual(self.state(view.observations_text), "disabled")
+
+    def test_activate_disabled_without_units_or_for_non_drafts(self):
+        self.insert_incident("A")
+        view = self.open_view("operador.central")
+        self.new_draft(view, "A")
+        self.assertEqual(self.state(view.activate_button), "disabled")
+        draft = view.selected_id
+        view.activate()
+        self.assertEqual(self.dispatch_state(draft), "CREADO")
+        for dispatch_id in range(2, 10):
+            self.select_dispatch(view, dispatch_id)
+            self.assertEqual(self.state(view.activate_button), "disabled")
+        self.select_dispatch(view, 1)
+        self.assertEqual(self.state(view.activate_button), "normal")
+
+    def test_activation_with_stale_unit_is_rejected(self):
+        view = self.open_view("operador.central")
+        incident_id, unit_id, draft = self.draft_with_unit(view)
+        self.set_unit_state(unit_id, "MANTENIMIENTO")
+        before = self.unit_row(unit_id)
+        with mock.patch.object(view, "confirm", return_value=True):
+            view.activate_button.invoke()
+        view.update()
+        text = view.message_label.cget("text")
+        self.assertIn(self.unit_code(1), text)
+        self.assertNotEqual(text, MSG_INTERNAL)
+        self.assertEqual(self.dispatch_state(draft), "CREADO")
+        self.assertEqual(self.state_of(incident_id), "REPORTADO")
+        self.assertEqual(self.unit_row(unit_id), before)
+        values = view.units_tree.item(str(unit_id), "values")
+        self.assertEqual(values[4], self.unit_state_name("MANTENIMIENTO"))
+        self.assertEqual(values[5], "No disponible ahora")
+
+    def test_activation_service_error_is_generic(self):
+        view = self.open_view("operador.central")
+        incident_id, unit_id, draft = self.draft_with_unit(view)
+        error = DispatchServiceError("SELECT * FROM despachos Traceback")
+        with mock.patch.object(dispatch_controller, "activate_dispatch", side_effect=error), \
+                mock.patch.object(view, "confirm", return_value=True), \
+                self.assertLogs("views.dispatch_view", level="ERROR"):
+            view.activate_button.invoke()
+        text = view.message_label.cget("text")
+        self.assertEqual(text, MSG_INTERNAL)
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("SELECT", text)
+        self.assertEqual(self.dispatch_state(draft), "CREADO")
+
     def test_refresh_keeps_selection_filters_and_typed_text(self):
         self.insert_incident("A")
         self.temp_unit(name="Alfa")
@@ -568,6 +653,10 @@ class DispatchViewTest(DispatchTestBase):
                 mock.patch.object(view, "confirm", return_value=True):
             view.cancel_draft()
         self.assertEqual(view.message_label.cget("text"), MSG_DENIED_WRITE)
+        view.activate_button.configure(state="normal")
+        with mock.patch.object(view, "confirm", return_value=True):
+            view.activate()
+        self.assertEqual(view.message_label.cget("text"), MSG_DENIED_WRITE)
         self.assertEqual(self.dispatch_state(1), "CREADO")
         view.clear_form()
         self.insert_incident("A")
@@ -595,7 +684,8 @@ class DispatchViewTest(DispatchTestBase):
 
         walk(view)
         self.assertEqual(texts, BUTTONS)
-        for forbidden in ("Activar", "EN_RUTA", "EN_ESCENA", "Liberar", "tripulaci", "Eliminar"):
+        self.assertEqual(SOURCE.count('text="Activar despacho"'), 1)
+        for forbidden in ("EN_RUTA", "EN_ESCENA", "Liberar", "tripulaci", "Eliminar"):
             self.assertNotIn(forbidden, SOURCE)
 
     def test_source_has_no_data_access_or_role_names(self):
