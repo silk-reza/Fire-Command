@@ -46,6 +46,7 @@ class MainViewAccessTest(unittest.TestCase):
         # Catálogos ya no es una etiqueta pendiente: abre el módulo de estaciones
         self.assertEqual(view.access_widgets[perm.PERMISSION_MANAGE_CATALOGS].cget("text"), "Estaciones")
         self.assertEqual(view.access_widgets[perm.PERMISSION_MANAGE_RESOURCES].cget("text"), "Personal")
+        self.assertEqual(view.units_button.cget("text"), "Unidades")
 
     def test_operator_has_no_admin_items(self):
         view = self.open_view("operador.central")
@@ -62,12 +63,14 @@ class MainViewAccessTest(unittest.TestCase):
             if isinstance(w, ctk.CTkButton)
         ]
         self.assertIn("Personal", texts)
+        self.assertIn("Unidades", texts)
         self.assertNotIn("Estaciones", texts)
         self.assertNotIn("Usuarios", texts)
 
     def test_read_only_user_sees_only_view_items(self):
         view = self.open_view("consulta.sur")
         self.assertEqual(set(view.access_widgets), VIEW_ONLY)
+        self.assertIsNone(view.units_button)
         self.assertIsNotNone(view.read_only_label)
         self.assertEqual(view.read_only_label.cget("text"), "Modo solo lectura")
         self.assertTrue(view.read_only_label.winfo_ismapped())

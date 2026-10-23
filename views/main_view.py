@@ -5,6 +5,7 @@ from utils import permissions as perm
 from utils import session
 from views.personnel_view import PersonnelView
 from views.station_view import StationView
+from views.unit_view import UnitView
 from views.user_view import UserView
 
 READ_ONLY_TEXT = "Modo solo lectura"
@@ -34,6 +35,8 @@ class MainView(ctk.CTk):
         self.user_view = None
         self.station_view = None
         self.personnel_view = None
+        self.unit_view = None
+        self.units_button = None
 
         frame = ctk.CTkFrame(self)
         frame.pack(padx=30, pady=30)
@@ -66,9 +69,11 @@ class MainView(ctk.CTk):
                 widget = ctk.CTkButton(frame, text="Estaciones", command=self.open_stations)
                 widget.pack(padx=30, pady=4, anchor="w")
             elif permission == perm.PERMISSION_MANAGE_RESOURCES:
-                # Recursos: por ahora solo el módulo de personal
+                # Recursos: módulos de personal y unidades
                 widget = ctk.CTkButton(frame, text="Personal", command=self.open_personnel)
                 widget.pack(padx=30, pady=4, anchor="w")
+                self.units_button = ctk.CTkButton(frame, text="Unidades", command=self.open_units)
+                self.units_button.pack(padx=30, pady=4, anchor="w")
             else:
                 widget = ctk.CTkLabel(frame, text=f"{text}: {PENDING_NOTE}")
                 widget.pack(padx=30, pady=2, anchor="w")
@@ -112,6 +117,14 @@ class MainView(ctk.CTk):
             return self.personnel_view
         self.personnel_view = PersonnelView(self)
         return self.personnel_view
+
+    def open_units(self):
+        """Abre el módulo de unidades; si ya está abierto, lo trae al frente."""
+        if self.unit_view is not None and self.unit_view.winfo_exists():
+            self.unit_view.lift()
+            return self.unit_view
+        self.unit_view = UnitView(self)
+        return self.unit_view
 
     def logout(self):
         """Limpia la sesión y pide volver al login."""
