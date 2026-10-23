@@ -163,7 +163,8 @@ class DispatchOperationTest(DispatchTestBase):
         self.assertEqual(self.unit_state(unit_id), "REGRESANDO")
         self.assertFalse(self.has_active_participation(unit_id))
         self.assertEqual(self.active_participation_count(unit_id), 0)
-        self.assertEqual(self.dispatch_state(dispatch_id), "ACTIVO")
+        # Era la única unidad: al liberarla el despacho se completa (OBJ 13)
+        self.assertEqual(self.dispatch_state(dispatch_id), "COMPLETADO")
         self.assertEqual(self.unit_audit(unit_id)[-1][4], (
             f"EN_ESCENA → REGRESANDO por liberación normal (despacho #{dispatch_id})."))
 

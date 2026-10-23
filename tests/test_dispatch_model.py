@@ -626,7 +626,20 @@ class DispatchModelTest(DispatchTestBase):
             encoding="utf-8")
         activation = function_body(model_source, "activate_dispatch")
         operation = function_body(model_source, "_operate_unit")
-        outside = model_source.replace(activation, "").replace(operation, "")
+        completion = function_body(
+            model_source, "_complete_dispatch_if_no_active_participations")
+        outside = (model_source.replace(activation, "").replace(operation, "")
+                   .replace(completion, ""))
+        # El helper de finalización: único UPDATE a COMPLETADO, llamado solo al iniciar regreso
+        self.assertEqual(completion.count("UPDATE despachos"), 1)
+        self.assertEqual(completion.count("fecha_finalizacion = %s"), 1)
+        self.assertEqual(completion.count("_state_id_by_code(cursor, COMPLETED_STATE_CODE)"), 1)
+        self.assertEqual(completion.count("UPDATE unidades") + completion.count("UPDATE incidentes"), 0)
+        self.assertEqual(completion.count("DELETE"), 0)
+        self.assertEqual(
+            model_source.count("_complete_dispatch_if_no_active_participations("), 2)
+        call_index = operation.index("_complete_dispatch_if_no_active_participations(")
+        self.assertIn('if kind == "return":', operation[max(0, call_index - 120):call_index])
         # Solo activate_dispatch y _operate_unit (OBJ 12) escriben unidades e incidentes
         self.assertEqual(operation.count("UPDATE unidades"), 1)
         self.assertEqual(operation.count("UPDATE incidentes"), 1)
@@ -666,9 +679,9 @@ class DispatchModelTest(DispatchTestBase):
         self.assertEqual(activation.count("_state_id_by_code(cursor, DRAFT_STATE_CODE)"), 1)
         self.assertIn("AND id_estado_despacho = %s", activation)
         # Estados de despacho: CANCELADO en el borrador y ACTIVO solo al activar
-        self.assertEqual(model_source.count("SET id_estado_despacho"), 2)
+        self.assertEqual(model_source.count("SET id_estado_despacho"), 3)
         self.assertEqual(model_source.count("_state_id_by_code(cursor, CANCELLED_STATE_CODE)"), 1)
-        self.assertEqual(model_source.count("UPDATE despachos"), 3)
+        self.assertEqual(model_source.count("UPDATE despachos"), 4)
         self.assertEqual(model_source.count("DELETE"), 1)
         delete_block = model_source[model_source.index("DELETE du FROM"):]
         delete_block = delete_block[:delete_block.index('"""')]

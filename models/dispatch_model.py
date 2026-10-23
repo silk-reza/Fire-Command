@@ -8,6 +8,13 @@ from models import unit_model
 DRAFT_STATE_CODE = "CREADO"
 CANCELLED_STATE_CODE = "CANCELADO"
 ACTIVATED_STATE_CODE = "ACTIVO"
+COMPLETED_STATE_CODE = "COMPLETADO"
+# Participación activa (definición aprobada): asignada y sin liberar ni cancelar.
+# El despacho debe estar además en estado ACTIVO.
+ACTIVE_PARTICIPATION_PREDICATE = (
+    "fecha_asignacion IS NOT NULL AND fecha_liberacion IS NULL "
+    "AND fecha_cancelacion IS NULL"
+)
 DISPATCHED_UNIT_STATE_CODE = "DESPACHADA"
 INCIDENT_REPORTED_CODE = "REPORTADO"
 INCIDENT_ASSIGNED_CODE = "ASIGNADO"
@@ -774,6 +781,52 @@ _RETURN_DISPATCH_MESSAGE = (
 )
 
 
+def _count_active_participations(cursor, dispatch_id):
+    """Participaciones activas restantes del despacho, con lectura actual (no snapshot)."""
+    cursor.execute(
+        "SELECT id_despacho_unidad FROM despacho_unidades WHERE id_despacho = %s AND "
+        + ACTIVE_PARTICIPATION_PREDICATE + " FOR SHARE",
+        (dispatch_id,),
+    )
+    return len(cursor.fetchall())
+
+
+def _complete_dispatch_if_no_active_participations(cursor, dispatch_id, moment, user_id):
+    """ACTIVO -> COMPLETADO si ya no quedan participaciones activas.
+
+    Corre dentro de la transacción del llamador (sin commit ni rollback), que debe
+    tener bloqueado el despacho FOR UPDATE. Devuelve True si lo completó.
+    """
+    # Lectura bloqueante: ve lo confirmado por otras transacciones y lo propio
+    if _count_active_participations(cursor, dispatch_id) > 0:
+        return False
+    cursor.execute(
+        """
+        SELECT s.codigo AS state_code
+        FROM despachos d
+        INNER JOIN estados_despacho s ON s.id_estado_despacho = d.id_estado_despacho
+        WHERE d.id_despacho = %s
+        FOR UPDATE OF d
+        """,
+        (dispatch_id,),
+    )
+    row = cursor.fetchone()
+    if row is None or row["state_code"] != ACTIVATED_STATE_CODE:
+        return False
+    completed_id = _state_id_by_code(cursor, COMPLETED_STATE_CODE)
+    active_id = _state_id_by_code(cursor, ACTIVATED_STATE_CODE)
+    # Misma marca de tiempo que la liberación: fecha_finalizacion >= fecha_despacho
+    cursor.execute(
+        "UPDATE despachos SET id_estado_despacho = %s, fecha_finalizacion = %s "
+        "WHERE id_despacho = %s AND id_estado_despacho = %s",
+        (completed_id, moment, dispatch_id, active_id),
+    )
+    _expect_one_row(cursor, "despacho")
+    _audit(cursor, user_id, "CAMBIO_ESTADO", dispatch_id,
+           "ACTIVO → COMPLETADO: sin participaciones activas.")
+    return True
+
+
 def _unit_state_id(cursor, state_code):
     cursor.execute(
         "SELECT id_estado_unidad FROM estados_unidad WHERE codigo = %s", (state_code,)
@@ -813,14 +866,18 @@ def _operate_unit(kind, dispatch_id, unit_id, user_id):
                 (head["id_incidente"],),
             )
             incident = cursor.fetchone()
-        # Solo importa que el estado ACTIVO del despacho sea estable durante la transacción
+        # Solo importa que el estado ACTIVO del despacho sea estable durante la transacción;
+        # al iniciar el regreso se bloquea FOR UPDATE (despacho -> unidad -> du) para que dos
+        # liberaciones simultáneas se serialicen y la última vea a la otra ya liberada
         dispatch_query = """
             SELECT s.codigo AS state_code
             FROM despachos d
             INNER JOIN estados_despacho s ON s.id_estado_despacho = d.id_estado_despacho
             WHERE d.id_despacho = %s
             """
-        if not returning_done:
+        if kind == "return":
+            dispatch_query += "FOR UPDATE OF d"
+        elif not returning_done:
             dispatch_query += "FOR SHARE OF d"
         cursor.execute(dispatch_query, (dispatch_id,))
         dispatch_state = cursor.fetchone()["state_code"]
@@ -900,6 +957,9 @@ def _operate_unit(kind, dispatch_id, unit_id, user_id):
         )
         _expect_one_row(cursor, "unidad")
         _audit_unit(cursor, user_id, unit_id, step["detail"].format(id=dispatch_id))
+        if kind == "return":
+            _complete_dispatch_if_no_active_participations(
+                cursor, dispatch_id, moment, user_id)
         if arrival and incident["state_code"] == "ASIGNADO":
             cursor.execute(
                 "SELECT id_estado_incidente FROM estados_incidente WHERE codigo = %s",
