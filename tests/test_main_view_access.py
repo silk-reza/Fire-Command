@@ -47,6 +47,9 @@ class MainViewAccessTest(unittest.TestCase):
         self.assertEqual(view.access_widgets[perm.PERMISSION_MANAGE_CATALOGS].cget("text"), "Estaciones")
         self.assertEqual(view.access_widgets[perm.PERMISSION_MANAGE_RESOURCES].cget("text"), "Personal")
         self.assertEqual(view.units_button.cget("text"), "Unidades")
+        incidents = view.access_widgets[perm.PERMISSION_OPERATE_INCIDENTS]
+        self.assertEqual(incidents.cget("text"), "Incidentes")
+        self.assertIs(incidents, view.access_widgets[perm.PERMISSION_VIEW_OPERATIONAL_DATA])
 
     def test_operator_has_no_admin_items(self):
         view = self.open_view("operador.central")
@@ -64,6 +67,7 @@ class MainViewAccessTest(unittest.TestCase):
         ]
         self.assertIn("Personal", texts)
         self.assertIn("Unidades", texts)
+        self.assertIn("Incidentes", texts)
         self.assertNotIn("Estaciones", texts)
         self.assertNotIn("Usuarios", texts)
 
@@ -71,6 +75,11 @@ class MainViewAccessTest(unittest.TestCase):
         view = self.open_view("consulta.sur")
         self.assertEqual(set(view.access_widgets), VIEW_ONLY)
         self.assertIsNone(view.units_button)
+        self.assertEqual(view.incidents_button.cget("text"), "Incidentes")
+        self.assertIs(
+            view.access_widgets[perm.PERMISSION_VIEW_OPERATIONAL_DATA], view.incidents_button
+        )
+        self.assertNotIn(perm.PERMISSION_OPERATE_INCIDENTS, view.access_widgets)
         self.assertIsNotNone(view.read_only_label)
         self.assertEqual(view.read_only_label.cget("text"), "Modo solo lectura")
         self.assertTrue(view.read_only_label.winfo_ismapped())

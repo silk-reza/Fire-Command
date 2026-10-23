@@ -3,6 +3,7 @@ import customtkinter as ctk
 from controllers import access_controller
 from utils import permissions as perm
 from utils import session
+from views.incident_view import IncidentView
 from views.personnel_view import PersonnelView
 from views.station_view import StationView
 from views.unit_view import UnitView
@@ -37,6 +38,8 @@ class MainView(ctk.CTk):
         self.personnel_view = None
         self.unit_view = None
         self.units_button = None
+        self.incident_view = None
+        self.incidents_button = None
 
         frame = ctk.CTkFrame(self)
         frame.pack(padx=30, pady=30)
@@ -74,6 +77,14 @@ class MainView(ctk.CTk):
                 widget.pack(padx=30, pady=4, anchor="w")
                 self.units_button = ctk.CTkButton(frame, text="Unidades", command=self.open_units)
                 self.units_button.pack(padx=30, pady=4, anchor="w")
+            elif permission in (perm.PERMISSION_OPERATE_INCIDENTS, perm.PERMISSION_VIEW_OPERATIONAL_DATA):
+                # Un solo acceso a incidentes; dentro del módulo se decide lectura o escritura
+                if self.incidents_button is None:
+                    self.incidents_button = ctk.CTkButton(
+                        frame, text="Incidentes", command=self.open_incidents
+                    )
+                    self.incidents_button.pack(padx=30, pady=4, anchor="w")
+                widget = self.incidents_button
             else:
                 widget = ctk.CTkLabel(frame, text=f"{text}: {PENDING_NOTE}")
                 widget.pack(padx=30, pady=2, anchor="w")
@@ -125,6 +136,14 @@ class MainView(ctk.CTk):
             return self.unit_view
         self.unit_view = UnitView(self)
         return self.unit_view
+
+    def open_incidents(self):
+        """Abre el módulo de incidentes; si ya está abierto, lo trae al frente."""
+        if self.incident_view is not None and self.incident_view.winfo_exists():
+            self.incident_view.lift()
+            return self.incident_view
+        self.incident_view = IncidentView(self)
+        return self.incident_view
 
     def logout(self):
         """Limpia la sesión y pide volver al login."""
