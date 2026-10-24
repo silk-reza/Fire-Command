@@ -628,8 +628,23 @@ class DispatchModelTest(DispatchTestBase):
         operation = function_body(model_source, "_operate_unit")
         completion = function_body(
             model_source, "_complete_dispatch_if_no_active_participations")
+        cancel_helper = function_body(model_source, "_cancel_active_dispatch_in_tx")
         outside = (model_source.replace(activation, "").replace(operation, "")
-                   .replace(completion, ""))
+                   .replace(completion, "").replace(cancel_helper, ""))
+        # Cancelación de ACTIVO (OBJ 14): único UPDATE de participaciones a cancelada y
+        # transiciones de unidad; nunca completa el despacho ni toca el incidente
+        self.assertEqual(cancel_helper.count("UPDATE despachos"), 1)
+        self.assertEqual(cancel_helper.count("UPDATE despacho_unidades"), 1)
+        self.assertIn("SET fecha_cancelacion = %s", cancel_helper)
+        self.assertEqual(cancel_helper.count("UPDATE unidades"), 1)
+        self.assertEqual(cancel_helper.count("UPDATE incidentes"), 0)
+        self.assertEqual(cancel_helper.count("DELETE"), 0)
+        self.assertEqual(cancel_helper.count("INSERT INTO"), 0)
+        self.assertNotIn("_complete_dispatch_if_no_active_participations", cancel_helper)
+        self.assertNotIn("COMPLETED_STATE_CODE", cancel_helper)
+        self.assertEqual(cancel_helper.count("_state_id_by_code(cursor, CANCELLED_STATE_CODE)"), 1)
+        public_cancel = function_body(model_source, "cancel_active_dispatch")
+        self.assertNotIn("UPDATE ", public_cancel.replace("FOR UPDATE", ""))
         # El helper de finalización: único UPDATE a COMPLETADO, llamado solo al iniciar regreso
         self.assertEqual(completion.count("UPDATE despachos"), 1)
         self.assertEqual(completion.count("fecha_finalizacion = %s"), 1)
@@ -661,7 +676,7 @@ class DispatchModelTest(DispatchTestBase):
         # Las constantes de activación solo aparecen en su definición
         for constant in ("ACTIVATED_STATE_CODE", "DISPATCHED_UNIT_STATE_CODE",
                          "INCIDENT_ASSIGNED_CODE"):
-            self.assertEqual(outside.count(constant), 1, constant)
+            self.assertEqual(outside.replace(public_cancel, "").count(constant), 1, constant)
         # Solo queda la definición de la constante con el literal ACTIVO
         self.assertEqual(outside.count('"ACTIVO"'), 1)
         self.assertNotIn("ACTIVO", controller_source)
@@ -679,9 +694,9 @@ class DispatchModelTest(DispatchTestBase):
         self.assertEqual(activation.count("_state_id_by_code(cursor, DRAFT_STATE_CODE)"), 1)
         self.assertIn("AND id_estado_despacho = %s", activation)
         # Estados de despacho: CANCELADO en el borrador y ACTIVO solo al activar
-        self.assertEqual(model_source.count("SET id_estado_despacho"), 3)
-        self.assertEqual(model_source.count("_state_id_by_code(cursor, CANCELLED_STATE_CODE)"), 1)
-        self.assertEqual(model_source.count("UPDATE despachos"), 4)
+        self.assertEqual(model_source.count("SET id_estado_despacho"), 4)
+        self.assertEqual(outside.count("_state_id_by_code(cursor, CANCELLED_STATE_CODE)"), 1)
+        self.assertEqual(model_source.count("UPDATE despachos"), 5)
         self.assertEqual(model_source.count("DELETE"), 1)
         delete_block = model_source[model_source.index("DELETE du FROM"):]
         delete_block = delete_block[:delete_block.index('"""')]

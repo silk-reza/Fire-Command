@@ -276,7 +276,8 @@ class IncidentModelTest(IncidentTestBase):
         self.assertIsNone(incident["closed_at"])
 
     def test_cancel_rejected_states_and_twice(self):
-        for state in ("ASIGNADO", "EN_ATENCION", "CONTROLADO", "CERRADO", "CANCELADO"):
+        # ASIGNADO y EN_ATENCION sin control ya se pueden cancelar desde OBJ 14
+        for state in ("CONTROLADO", "CERRADO", "CANCELADO"):
             iid = self.insert_incident(suffix=state, state_code=state)
             before = self.row(iid)
             with self.assertRaises(im.IncidentStateError, msg=state) as ctx:

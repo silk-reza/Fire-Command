@@ -12,6 +12,7 @@ from controllers.dispatch_controller import DispatchServiceError
 from tests._dispatch_support import DispatchTestBase, db_all, db_exec
 from utils import session
 from views import dispatch_view
+from views.incident_view import IncidentView
 from views.dispatch_view import (
     ALL_STATIONS, ALL_UNIT_TYPES, INCIDENT_PLACEHOLDER, MSG_DENIED_READ, MSG_DENIED_WRITE,
     MSG_INTERNAL, SHOW_ALL, SHOW_DRAFTS, DispatchView,
@@ -24,7 +25,7 @@ UNIT_TITLES = ["Código", "Nombre", "Tipo", "Estación", "Estado real", "Disponi
 AVAILABLE_TITLES = ["Código", "Nombre", "Tipo", "Estación", "Estado"]
 BUTTONS = {
     "Nuevo borrador", "Guardar cambios", "Agregar unidad", "Quitar unidad",
-    "Cancelar borrador", "Activar despacho", "Refrescar", "Marcar en ruta",
+    "Cancelar borrador", "Cancelar despacho", "Activar despacho", "Refrescar", "Marcar en ruta",
     "Marcar en escena", "Iniciar regreso", "Marcar disponible", "Limpiar selección", "Regresar",
     "Quitar filtros", "Buscar", "Limpiar filtros",
 }
@@ -158,6 +159,7 @@ class DispatchViewTest(DispatchTestBase):
         for name in ("save_button", "add_button", "remove_button", "cancel_button"):
             self.assertEqual(self.state(getattr(view, name)), "normal", name)
         self.assertEqual(self.state(view.create_button), "disabled")
+        self.assertEqual(self.state(view.cancel_dispatch_button), "disabled")
 
     def test_show_and_incident_filters(self):
         view = self.open_view("admin.demo")
@@ -665,6 +667,151 @@ class DispatchViewTest(DispatchTestBase):
         self.assertNotIn("Traceback", text)
         self.assertNotIn("SELECT", text)
         self.assertEqual(self.unit_state(unit_id), "DESPACHADA")
+
+    def test_cancel_dispatch_button_enablement(self):
+        incident_id, unit_id, dispatch_id = self.active_dispatch("A")
+        view = self.open_view("operador.central")
+        self.select_dispatch(view, dispatch_id)
+        self.assertEqual(self.state(view.cancel_dispatch_button), "normal")
+        self.assertEqual(self.state(view.cancel_button), "disabled")
+        for seed_id, expected in ((1, "disabled"), (2, "normal"), (5, "disabled"),
+                                  (7, "disabled")):
+            self.select_dispatch(view, seed_id)
+            self.assertEqual(self.state(view.cancel_dispatch_button), expected, seed_id)
+        self.select_dispatch(view, 1)
+        self.assertEqual(self.state(view.cancel_button), "normal")
+        view.close()
+        session.end_session()
+        reader = self.open_view("consulta.sur")
+        self.select_dispatch(reader, dispatch_id)
+        self.assertEqual(self.state(reader.cancel_dispatch_button), "disabled")
+
+    def test_cancel_active_dispatch_flow(self):
+        incident_id, first, dispatch_id = self.active_dispatch("A")
+        second = self.temp_unit()
+        # Segunda unidad en el mismo despacho: se agrega por un despacho de refuerzo temporal
+        extra = dispatch_controller.create_dispatch_draft({"incident_id": incident_id})
+        dispatch_controller.add_unit_to_draft(extra["dispatch_id"], second)
+        dispatch_controller.activate_dispatch(extra["dispatch_id"])
+        dispatch_controller.mark_unit_en_route(extra["dispatch_id"], second)
+        view = self.open_view("operador.central")
+        self.open_unit(view, extra["dispatch_id"], second)
+        incident_state = self.state_of(incident_id)
+        self.assertEqual(self.state(view.cancel_dispatch_button), "normal")
+
+        for reason in (None, ""):
+            with mock.patch.object(view, "ask_reason", return_value=reason), \
+                    mock.patch.object(view, "confirm", return_value=True):
+                view.cancel_dispatch_button.invoke()
+            self.assertIn("motivo es obligatorio", view.message_label.cget("text"))
+            self.assertEqual(self.dispatch_state(extra["dispatch_id"]), "ACTIVO")
+        with mock.patch.object(view, "ask_reason", return_value="   "), \
+                mock.patch.object(view, "confirm", return_value=True):
+            view.cancel_dispatch_button.invoke()
+        self.assertIn("motivo", view.message_label.cget("text"))
+        self.assertEqual(self.dispatch_state(extra["dispatch_id"]), "ACTIVO")
+        with mock.patch.object(view, "ask_reason", return_value="Motivo"), \
+                mock.patch.object(view, "confirm", return_value=False):
+            view.cancel_dispatch_button.invoke()
+        self.assertEqual(self.dispatch_state(extra["dispatch_id"]), "ACTIVO")
+        self.assertEqual(self.unit_state(second), "EN_RUTA")
+
+        reason = "r" * 250
+        with mock.patch.object(view, "ask_reason", return_value=reason), \
+                mock.patch.object(view, "confirm", return_value=True) as confirm:
+            view.cancel_dispatch_button.invoke()
+        view.update()
+        self.assertIn("incidente conserva su estado", confirm.call_args[0][0])
+        self.assertEqual(self.dispatch_state(extra["dispatch_id"]), "CANCELADO")
+        self.assertEqual(self.dispatch_state(dispatch_id), "ACTIVO")
+        self.assertEqual(self.unit_state(second), "REGRESANDO")
+        self.assertEqual(self.unit_state(first), "DESPACHADA")
+        self.assertEqual(self.state_of(incident_id), incident_state)
+        self.assertIn("Cancelado", view.state_label.cget("text"))
+        self.assertEqual(
+            view.units_tree.item(str(second), "values")[4], self.unit_state_name("REGRESANDO"))
+        self.assertEqual(view.tree.item(str(extra["dispatch_id"]), "values")[2], "Cancelado")
+        for name in ("cancel_dispatch_button", "cancel_button", "activate_button",
+                     "save_button", "add_button", "remove_button"):
+            self.assertEqual(self.state(getattr(view, name)), "disabled", name)
+        # La unidad que regresa se libera aunque el despacho esté cancelado
+        view.units_tree.selection_set(str(second))
+        view.update()
+        self.assertEqual(self.enabled_actions(view), ["available_button"])
+        with mock.patch.object(view, "confirm", return_value=True):
+            view.available_button.invoke()
+        view.update()
+        self.assertEqual(self.unit_state(second), "DISPONIBLE")
+        self.assertEqual(self.enabled_actions(view), [])
+
+        # Cancelar el despacho con la unidad DESPACHADA la deja Disponible
+        self.open_unit(view, dispatch_id, first)
+        with mock.patch.object(view, "ask_reason", return_value="Otro motivo"), \
+                mock.patch.object(view, "confirm", return_value=True):
+            view.cancel_dispatch_button.invoke()
+        view.update()
+        self.assertEqual(self.unit_state(first), "DISPONIBLE")
+        self.assertEqual(
+            view.units_tree.item(str(first), "values")[4], self.unit_state_name("DISPONIBLE"))
+        self.assertEqual(self.state_of(incident_id), incident_state)
+
+    def test_cancel_active_dispatch_read_only_and_errors(self):
+        incident_id, unit_id, dispatch_id = self.active_dispatch("A")
+        view = self.open_view("operador.central")
+        self.open_unit(view, dispatch_id, unit_id)
+        error = DispatchServiceError("SELECT * FROM despachos Traceback")
+        with mock.patch.object(dispatch_controller, "cancel_active_dispatch", side_effect=error), \
+                mock.patch.object(view, "ask_reason", return_value="Motivo"), \
+                mock.patch.object(view, "confirm", return_value=True), \
+                self.assertLogs("views.dispatch_view", level="ERROR"):
+            view.cancel_dispatch_button.invoke()
+        text = view.message_label.cget("text")
+        self.assertEqual(text, MSG_INTERNAL)
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("SELECT", text)
+        view.close()
+        session.end_session()
+        reader = self.open_view("consulta.sur")
+        self.open_unit(reader, dispatch_id, unit_id)
+        self.assertEqual(self.state(reader.cancel_dispatch_button), "disabled")
+        before = (self.dispatch_row(dispatch_id), self.unit_row(unit_id))
+        reader.cancel_dispatch_button.configure(state="normal")
+        with mock.patch.object(reader, "ask_reason", return_value="Motivo"), \
+                mock.patch.object(reader, "confirm", return_value=True):
+            reader.cancel_active()
+        self.assertEqual(reader.message_label.cget("text"), MSG_DENIED_WRITE)
+        self.assertEqual((self.dispatch_row(dispatch_id), self.unit_row(unit_id)), before)
+
+    def test_incident_view_cancel_cascade(self):
+        incident_id, unit_id, dispatch_id = self.active_dispatch("A")
+        dispatch_controller.mark_unit_en_route(dispatch_id, unit_id)
+        draft_unit = self.temp_unit()
+        draft = dispatch_controller.create_dispatch_draft({"incident_id": incident_id})
+        dispatch_controller.add_unit_to_draft(draft["dispatch_id"], draft_unit)
+        self.assertEqual(self.state_of(incident_id), "ASIGNADO")
+        view = IncidentView(self.root)
+        view.update()
+        code = f"{self.prefix}-A"
+        for iid in view.tree.get_children():
+            if view.tree.item(iid, "values")[0] == code:
+                view.tree.selection_set(iid)
+        view.update()
+        self.assertEqual(str(view.cancel_button.cget("state")), "normal")
+        with mock.patch.object(view, "ask_reason", return_value="Falsa alarma") as ask, \
+                mock.patch.object(view, "confirm", return_value=True) as confirm:
+            view.cancel_button.invoke()
+        view.update()
+        for text in (ask.call_args[0][0], confirm.call_args[0][0]):
+            self.assertIn("activos", text)
+        self.assertIn("Regresando", confirm.call_args[0][0])
+        self.assertEqual(self.state_of(incident_id), "CANCELADO")
+        self.assertEqual(self.dispatch_state(dispatch_id), "CANCELADO")
+        self.assertEqual(self.dispatch_state(draft["dispatch_id"]), "CANCELADO")
+        self.assertEqual(self.unit_state(unit_id), "REGRESANDO")
+        self.assertEqual(self.unit_state(draft_unit), "DISPONIBLE")
+        self.assertEqual(view.state_label.cget("text"), "Estado actual: Cancelado")
+        self.assertEqual(str(view.cancel_button.cget("state")), "disabled")
+        self.assertEqual(str(view.save_button.cget("state")), "disabled")
 
     def test_refresh_keeps_selection_filters_and_typed_text(self):
         self.insert_incident("A")

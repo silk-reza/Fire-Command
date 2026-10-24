@@ -372,19 +372,43 @@ class IncidentViewTest(IncidentTestBase):
                 self.assertIn("cerrado o cancelado", view.hint_label.cget("text"))
                 view.close()
 
-    def test_cancel_button_only_for_reported(self):
+    def test_cancel_button_enablement_by_state(self):
         for state in ("ASIGNADO", "EN_ATENCION", "CONTROLADO", "CERRADO"):
             self.insert_incident(state[:4], state_code=state)
+        controlled = self.insert_incident("ECON", state_code="CONTROLADO")
+        from tests._incident_support import db_exec
+        db_exec(
+            "UPDATE incidentes SET id_estado_incidente = (SELECT id_estado_incidente "
+            "FROM estados_incidente WHERE codigo = 'EN_ATENCION') WHERE id_incidente = %s",
+            (controlled,))
         self.insert_incident("REP")
         view = self.open_incidents("operador.central")
-        for state in ("ASIGNADO", "EN_ATENCION", "CONTROLADO", "CERRADO"):
-            self.select(view, self.code(state[:4]))
-            self.assertEqual(self.button_state(view.cancel_button), "disabled", state)
+        for suffix, expected in (("ASIG", "normal"), ("EN_A", "normal"), ("ECON", "disabled"),
+                                 ("CONT", "disabled"), ("CERR", "disabled")):
+            self.select(view, self.code(suffix))
+            self.assertEqual(self.button_state(view.cancel_button), expected, suffix)
         for state in ("ASIGNADO", "EN_ATENCION", "CONTROLADO"):
             self.select(view, self.code(state[:4]))
             self.assertEqual(self.button_state(view.save_button), "normal", state)
         self.select(view, self.code("REP"))
         self.assertEqual(self.button_state(view.cancel_button), "normal")
+
+    def test_cancel_service_error_is_generic(self):
+        from controllers import incident_controller
+        from controllers.incident_controller import IncidentServiceError
+        self.insert_incident("S")
+        view = self.open_incidents("operador.central")
+        self.select(view, self.code("S"))
+        view.confirm = mock.Mock(return_value=True)
+        view.ask_reason = mock.Mock(return_value="Motivo")
+        error = IncidentServiceError("SELECT * FROM incidentes Traceback")
+        with mock.patch.object(incident_controller, "cancel_incident", side_effect=error), \
+                self.assertLogs("views.incident_view", level="ERROR"):
+            view.cancel_button.invoke()
+        text = view.message_label.cget("text")
+        self.assertEqual(text, incident_view.MSG_INTERNAL)
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("SELECT", text)
 
     def test_cancel_flow(self):
         incident_id = self.insert_incident("C")

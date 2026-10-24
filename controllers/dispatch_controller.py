@@ -423,3 +423,25 @@ def start_unit_return(dispatch_id, unit_id):
 def mark_unit_available(dispatch_id, unit_id):
     """REGRESANDO -> DISPONIBLE."""
     return _operate(dispatch_model.mark_unit_available, dispatch_id, unit_id)
+
+
+def cancel_active_dispatch(dispatch_id, reason):
+    """Cancela un despacho activo con motivo obligatorio; no toca el incidente."""
+    _require_write()
+    dispatch_id = _validate_id(dispatch_id, "despacho")
+    if not isinstance(reason, str) or not reason.strip():
+        raise DispatchValidationError("El motivo de cancelación es obligatorio.")
+    reason = reason.strip()
+    if len(reason) > _MAX_REASON_LENGTH:
+        raise DispatchValidationError(
+            f"El motivo de cancelación no puede superar {_MAX_REASON_LENGTH} caracteres."
+        )
+    user_id = _session_user_id()
+    try:
+        if not dispatch_model.cancel_active_dispatch(dispatch_id, reason, user_id):
+            raise DispatchNotFoundError("El despacho no existe.")
+        return _full_dispatch(dispatch_id)
+    except _MODEL_DOMAIN_ERRORS as error:
+        raise _domain_error(error) from error
+    except mysql.connector.Error as error:
+        raise _technical_error() from error

@@ -28,7 +28,7 @@ MSG_NOT_FOUND = "El despacho ya no existe."
 MSG_REASON_REQUIRED = "No se canceló el borrador: el motivo es obligatorio."
 MSG_SELECT_AVAILABLE = "Seleccione una unidad de la lista de unidades disponibles."
 MSG_SELECT_DRAFT_UNIT = "Seleccione una unidad de la lista de unidades del despacho."
-MSG_NOT_DRAFT = "Este despacho ya no es un borrador y solo puede consultarse."
+MSG_NOT_DRAFT = "Las observaciones y las unidades solo se editan en un borrador."
 READ_ONLY_TEXT = "Modo solo lectura"
 SHOW_ALL = "Todos"
 SHOW_DRAFTS = "Solo borradores"
@@ -59,7 +59,7 @@ UNIT_ACTIONS = {
     "EN_ESCENA": ("return_button", "start_unit_return", "Iniciar regreso",
                   "con regreso iniciado", (ACTIVE_STATE,)),
     "REGRESANDO": ("available_button", "mark_unit_available", "Marcar disponible",
-                   "disponible", (ACTIVE_STATE, COMPLETED_STATE)),
+                   "disponible", (ACTIVE_STATE, COMPLETED_STATE, CANCELLED_STATE)),
 }
 OBSERVATIONS_LIMIT = 60
 
@@ -308,27 +308,31 @@ class DispatchView(ctk.CTkToplevel):
         bar = ctk.CTkFrame(self, fg_color="transparent")
         bar.pack(padx=16, pady=(2, 8))
         self.create_button = ctk.CTkButton(
-            bar, text="Nuevo borrador", width=110, command=self.create
+            bar, text="Nuevo borrador", width=105, command=self.create
         )
         self.save_button = ctk.CTkButton(
             bar, text="Guardar cambios", width=110, command=self.save
         )
         self.add_button = ctk.CTkButton(
-            bar, text="Agregar unidad", width=110, command=self.add_unit
+            bar, text="Agregar unidad", width=105, command=self.add_unit
         )
         self.remove_button = ctk.CTkButton(
-            bar, text="Quitar unidad", width=100, command=self.remove_unit
+            bar, text="Quitar unidad", width=95, command=self.remove_unit
         )
         self.cancel_button = ctk.CTkButton(
-            bar, text="Cancelar borrador", width=125, fg_color="#b45309",
+            bar, text="Cancelar borrador", width=120, fg_color="#b45309",
             hover_color="#92400e", command=self.cancel_draft,
+        )
+        self.cancel_dispatch_button = ctk.CTkButton(
+            bar, text="Cancelar despacho", width=120, fg_color="#b45309",
+            hover_color="#92400e", command=self.cancel_active,
         )
         self.activate_button = ctk.CTkButton(
             bar, text="Activar despacho", width=115, fg_color="#2e7d32",
             hover_color="#1b5e20", command=self.activate,
         )
         self.refresh_button = ctk.CTkButton(
-            bar, text="Refrescar", width=80, fg_color="gray40", hover_color="gray30",
+            bar, text="Refrescar", width=75, fg_color="gray40", hover_color="gray30",
             command=self.refresh_all,
         )
         self.clear_button = ctk.CTkButton(
@@ -336,12 +340,12 @@ class DispatchView(ctk.CTkToplevel):
             hover_color="gray30", command=self.clear_form,
         )
         self.back_button = ctk.CTkButton(
-            bar, text="Regresar", width=80, fg_color="gray40", hover_color="gray30",
+            bar, text="Regresar", width=70, fg_color="gray40", hover_color="gray30",
             command=self.close,
         )
         for button in (
             self.create_button, self.save_button, self.add_button, self.remove_button,
-            self.cancel_button, self.activate_button, self.refresh_button, self.clear_button, self.back_button,
+            self.cancel_button, self.cancel_dispatch_button, self.activate_button, self.refresh_button, self.clear_button, self.back_button,
         ):
             button.pack(side="left", padx=3)
 
@@ -352,7 +356,7 @@ class DispatchView(ctk.CTkToplevel):
     def ask_reason(self, prompt):
         """Pide el motivo de cancelación; devuelve None si se cierra el diálogo."""
         try:
-            dialog = ctk.CTkInputDialog(text=prompt, title="Cancelar borrador")
+            dialog = ctk.CTkInputDialog(text=prompt, title="Cancelar")
             return dialog.get_input()
         finally:
             # El diálogo toma el grab y Tk no lo devuelve; se restablece el foco modal
@@ -654,6 +658,9 @@ class DispatchView(ctk.CTkToplevel):
                 self.can_write and draft and bool(self.units_tree.get_children())
             ),
         }
+        enabled[self.cancel_dispatch_button] = (
+            self.can_write and selected and self.selected_state_code == ACTIVE_STATE
+        )
         for button, on in enabled.items():
             button.configure(state="normal" if on else "disabled")
         self.hint_label.configure(text=MSG_NOT_DRAFT if selected and not draft else "")
@@ -679,7 +686,14 @@ class DispatchView(ctk.CTkToplevel):
                  f"Liberación: {_format_date(unit.get('released_at'))}"
         )
         action = UNIT_ACTIONS.get(unit["state_code"])
-        if action and self.can_write and self.selected_state_code in action[4]:
+        # En un despacho cancelado solo se libera una participación que sí fue asignada
+        cancelled_draft = (
+            self.selected_state_code == CANCELLED_STATE and unit.get("assigned_at") is None
+        )
+        if (
+            action and self.can_write and not cancelled_draft
+            and self.selected_state_code in action[4]
+        ):
             getattr(self, action[0]).configure(state="normal")
 
     def create(self):
@@ -822,3 +836,32 @@ class DispatchView(ctk.CTkToplevel):
             self.refresh_list()
             self.refresh_available()
             self.show_message(f"La unidad {code} quedó {done}.")
+
+    def cancel_active(self):
+        """Cancela un despacho ACTIVO con motivo obligatorio y confirmación."""
+        if self.selected_id is None or self.selected_state_code != ACTIVE_STATE:
+            return
+        number = self.selected_id
+        prompt = (
+            f"Motivo de la cancelación del despacho N.º {number}.\n"
+            "Las unidades se liberan y el incidente conserva su estado."
+        )
+        reason = self.ask_reason(prompt)
+        if reason is None or reason == "":
+            self.show_message("No se canceló el despacho: el motivo es obligatorio.", error=True)
+            return
+        message = (
+            f"¿Cancelar el despacho N.º {number}? Las unidades se liberan: las Despachada "
+            "vuelven a Disponible y las En ruta o En escena pasan a Regresando. El "
+            "incidente conserva su estado y esta acción no se puede deshacer."
+        )
+        if not self.confirm(message):
+            return
+        ok, dispatch = self._run(
+            dispatch_controller.cancel_active_dispatch, number, reason, write=True
+        )
+        if ok:
+            self._show_dispatch(dispatch, keep_text=True)
+            self.refresh_list()
+            self.refresh_available()
+            self.show_message(f"Despacho N.º {number} cancelado correctamente.")

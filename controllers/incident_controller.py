@@ -370,7 +370,7 @@ def update_incident(incident_id, data):
 
 
 def cancel_incident(incident_id, reason):
-    """Cancela un incidente REPORTADO con motivo obligatorio."""
+    """Cancela un incidente (Reportado, Asignado o En atención sin control) con motivo."""
     _require_write()
     incident_id = _validate_id(incident_id, "incidente")
     if not isinstance(reason, str) or not reason.strip():

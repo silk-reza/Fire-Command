@@ -35,7 +35,8 @@ COLOR_OK = "#2e9e5b"
 COLOR_WARNING = "#d97706"
 # Estados sin edición; solo se usa para presentar y habilitar controles
 TERMINAL_STATES = ("CERRADO", "CANCELADO")
-CANCELLABLE_STATE = "REPORTADO"
+CANCELLABLE_STATES = ("REPORTADO", "ASIGNADO")
+ATTENTION_STATE = "EN_ATENCION"
 DESCRIPTION_LIMIT = 60
 
 COLUMNS = (
@@ -73,6 +74,7 @@ class IncidentView(ctk.CTkToplevel):
         self.resizable(False, False)
         self.selected_id = None
         self.selected_state_code = None
+        self.selected_controlled_at = None
         self._refreshing = False
         # Solo presentación: texto del selector -> id
         self._type_ids = {}
@@ -430,6 +432,7 @@ class IncidentView(ctk.CTkToplevel):
         self._apply_form_options(incident["type_id"], incident["priority_id"])
         self.selected_id = incident["incident_id"]
         self.selected_state_code = incident["state_code"]
+        self.selected_controlled_at = incident.get("controlled_at")
         self._fill_form(incident)
         self.form_title.configure(text=f"Editando: {incident['code']}")
         self.state_label.configure(text=f"Estado actual: {incident['state_name']}")
@@ -487,6 +490,7 @@ class IncidentView(ctk.CTkToplevel):
         self._apply_form_options(None, None)
         self.selected_id = None
         self.selected_state_code = None
+        self.selected_controlled_at = None
         self._refreshing = True
         try:
             self.tree.selection_remove(*self.tree.selection())
@@ -508,15 +512,19 @@ class IncidentView(ctk.CTkToplevel):
     def _is_terminal(self):
         return self.selected_state_code in TERMINAL_STATES
 
+    def _is_cancellable(self):
+        """Presentación: el controlador decide si la cancelación procede."""
+        if self.selected_state_code in CANCELLABLE_STATES:
+            return True
+        return self.selected_state_code == ATTENTION_STATE and self.selected_controlled_at is None
+
     def _update_controls(self):
         selected = self.selected_id is not None
         terminal = selected and self._is_terminal()
         self._set_editable(self.can_write and not terminal)
         can_create = self.can_write and not selected
         can_save = self.can_write and selected and not terminal
-        can_cancel = (
-            self.can_write and selected and self.selected_state_code == CANCELLABLE_STATE
-        )
+        can_cancel = self.can_write and selected and self._is_cancellable()
         self.create_button.configure(state="normal" if can_create else "disabled")
         self.save_button.configure(state="normal" if can_save else "disabled")
         self.cancel_button.configure(state="normal" if can_cancel else "disabled")
@@ -567,15 +575,17 @@ class IncidentView(ctk.CTkToplevel):
         code = self.code_entry.get()
         prompt = (
             f"Motivo de la cancelación del incidente {code}.\n"
-            "Los despachos en borrador del incidente también se cancelarán."
+            "Los despachos en borrador y activos del incidente también se cancelarán."
         )
         reason = self.ask_reason(prompt)
         if reason is None or reason == "":
             self.show_message(MSG_REASON_REQUIRED, error=True)
             return
         message = (
-            f"¿Cancelar el incidente {code}? Sus despachos en borrador también "
-            "se cancelarán y esta acción no se puede deshacer."
+            f"¿Cancelar el incidente {code}? Sus despachos en borrador y activos también "
+            "se cancelarán y sus unidades se liberarán: las Despachada vuelven a "
+            "Disponible y las En ruta o En escena pasan a Regresando. Esta acción no "
+            "se puede deshacer."
         )
         if not self.confirm(message):
             return
@@ -587,5 +597,5 @@ class IncidentView(ctk.CTkToplevel):
             self.refresh_list()
             self.show_message(
                 f"Incidente {incident['code']} cancelado correctamente. "
-                "Sus despachos en borrador también quedaron cancelados."
+                "Sus despachos en borrador y activos también quedaron cancelados."
             )

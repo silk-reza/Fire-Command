@@ -4,6 +4,7 @@ from decimal import Decimal
 import mysql.connector
 
 from config.database import get_connection
+from models import dispatch_model
 
 INITIAL_STATE_CODE = "REPORTADO"
 CANCELLED_STATE_CODE = "CANCELADO"
@@ -205,12 +206,14 @@ def _translate_error(error):
     return None
 
 
-def _write(operation):
-    """Ejecuta operation(cursor) en su propia transacción."""
+def _write(operation, isolation=None):
+    """Ejecuta operation(cursor) en su propia transacción (isolation opcional)."""
     connection = get_connection()
     try:
         cursor = connection.cursor(dictionary=True)
         try:
+            if isolation:
+                connection.start_transaction(isolation_level=isolation)
             result = operation(cursor)
             connection.commit()
             return result
@@ -309,7 +312,7 @@ def _lock_incident(cursor, incident_id):
         """
         SELECT i.id_incidente, i.codigo, i.id_tipo_incidente, i.id_prioridad,
                i.direccion, i.referencia, i.latitud, i.longitud, i.descripcion,
-               i.personas_afectadas, s.codigo AS state_code
+               i.personas_afectadas, i.fecha_control, s.codigo AS state_code
         FROM incidentes i
         INNER JOIN estados_incidente s ON s.id_estado_incidente = i.id_estado_incidente
         WHERE i.id_incidente = %s
@@ -370,15 +373,20 @@ def update_incident(incident_id, fields, user_id):
     return _write(operation)
 
 
-def _cancel_pending_dispatches(cursor, incident_id, incident_code, reason, user_id):
-    """Resuelve los despachos CREADO del incidente que se cancela (RD-30)."""
+def _cancel_pending_dispatches(cursor, incident_id, incident_code, reason, user_id,
+                               moment=None, allow_active=False):
+    """Resuelve los despachos CREADO (y ACTIVO si se permite) del incidente que se cancela."""
+    if moment is None:
+        cursor.execute("SELECT NOW() AS moment")
+        moment = cursor.fetchone()["moment"]
     # Los ids de estado se leen antes, sin bloqueo, para que el bloqueo no dependa de un JOIN
     cursor.execute(
         "SELECT id_estado_despacho, codigo FROM estados_despacho WHERE codigo IN (%s, %s, %s)",
         (DISPATCH_DRAFT_CODE, DISPATCH_ACTIVE_CODE, DISPATCH_CANCELLED_CODE),
     )
     state_ids = {row["codigo"]: row["id_estado_despacho"] for row in cursor.fetchall()}
-    # Orden de bloqueo: incidente (ya bloqueado), luego solo sus despachos por id ascendente
+    # Orden de bloqueo: incidente (ya bloqueado), sus despachos por id ascendente, luego las
+    # unidades por id ascendente y por último las participaciones
     cursor.execute(
         """
         SELECT id_despacho, id_estado_despacho
@@ -390,8 +398,10 @@ def _cancel_pending_dispatches(cursor, incident_id, incident_code, reason, user_
         (incident_id,),
     )
     all_dispatches = cursor.fetchall()
+    active = [r for r in all_dispatches
+              if r["id_estado_despacho"] == state_ids[DISPATCH_ACTIVE_CODE]]
     # Un REPORTADO con despacho ACTIVO es inconsistente: no se cancela desde aquí
-    if any(r["id_estado_despacho"] == state_ids[DISPATCH_ACTIVE_CODE] for r in all_dispatches):
+    if active and not allow_active:
         raise IncidentStateError(
             "El incidente tiene despachos activos y no puede cancelarse desde este módulo."
         )
@@ -399,20 +409,25 @@ def _cancel_pending_dispatches(cursor, incident_id, incident_code, reason, user_
         r for r in all_dispatches
         if r["id_estado_despacho"] == state_ids[DISPATCH_DRAFT_CODE]
     ]
-    if not dispatches:
-        return
+    participations = units = None
+    if active:
+        # Todas las unidades afectadas se bloquean antes de modificar participaciones
+        participations = dispatch_model._collect_active_participations(
+            cursor, [r["id_despacho"] for r in active])
+        units = dispatch_model._lock_units_ascending(
+            cursor, [p["id_unidad"] for p in participations])
     cancelled_dispatch_id = state_ids[DISPATCH_CANCELLED_CODE]
     for row in dispatches:
         # fecha_despacho queda NULL y las preselecciones no se tocan
         cursor.execute(
             """
             UPDATE despachos
-            SET id_estado_despacho = %s, fecha_cancelacion = NOW(),
+            SET id_estado_despacho = %s, fecha_cancelacion = %s,
                 motivo_cancelacion = %s
             WHERE id_despacho = %s
             """,
             # Mismo motivo del incidente, sin prefijos ni recortes
-            (cancelled_dispatch_id, reason, row["id_despacho"]),
+            (cancelled_dispatch_id, moment, reason, row["id_despacho"]),
         )
         cursor.execute(
             """
@@ -425,10 +440,19 @@ def _cancel_pending_dispatches(cursor, incident_id, incident_code, reason, user_
                 f"CREADO → CANCELADO por cancelación del incidente {incident_code}.",
             ),
         )
+    for row in active:
+        # Mismo cursor y mismo momento: sin transacciones anidadas
+        dispatch_model._cancel_active_dispatch_in_tx(
+            cursor, row["id_despacho"], reason, moment, user_id, participations, units)
+
+
+_CANCEL_STATE_MESSAGE = (
+    "Solo se puede cancelar un incidente Reportado, Asignado o En atención sin control registrado."
+)
 
 
 def cancel_incident(incident_id, reason, user_id):
-    """Cancela un incidente REPORTADO con motivo; False si no existe."""
+    """Cancela un incidente (REPORTADO, ASIGNADO o EN_ATENCION sin control); False si no existe."""
     if not isinstance(reason, str):
         raise InvalidIncidentDataError("El motivo de cancelación no es válido.")
     reason = reason.strip()
@@ -439,27 +463,35 @@ def cancel_incident(incident_id, reason, user_id):
         current = _lock_incident(cursor, incident_id)
         if current is None:
             return False
-        if current["state_code"] == CANCELLED_STATE_CODE:
+        state = current["state_code"]
+        if state == CANCELLED_STATE_CODE:
             raise IncidentStateError("El incidente ya está cancelado.")
-        if current["state_code"] != INITIAL_STATE_CODE:
-            raise IncidentStateError(
-                "Solo se puede cancelar un incidente en estado Reportado."
-            )
-        _cancel_pending_dispatches(cursor, incident_id, current["codigo"], reason, user_id)
+        cancellable = state in (INITIAL_STATE_CODE, "ASIGNADO") or (
+            state == "EN_ATENCION" and current["fecha_control"] is None)
+        if not cancellable:
+            raise IncidentStateError(_CANCEL_STATE_MESSAGE)
+        # Un solo momento para incidente, despachos y participaciones
+        cursor.execute("SELECT NOW() AS moment")
+        moment = cursor.fetchone()["moment"]
+        _cancel_pending_dispatches(
+            cursor, incident_id, current["codigo"], reason, user_id, moment,
+            allow_active=state != INITIAL_STATE_CODE)
         cancelled_id = _state_id_by_code(cursor, CANCELLED_STATE_CODE)
         cursor.execute(
             """
             UPDATE incidentes
-            SET id_estado_incidente = %s, fecha_cancelacion = NOW(),
+            SET id_estado_incidente = %s, fecha_cancelacion = %s,
                 motivo_cancelacion = %s
             WHERE id_incidente = %s
             """,
-            (cancelled_id, reason, incident_id),
+            (cancelled_id, moment, reason, incident_id),
         )
         _audit(
             cursor, user_id, "CAMBIO_ESTADO", incident_id,
-            f"REPORTADO → CANCELADO. Motivo: {reason}",
+            f"{state} → CANCELADO. Motivo: {reason}",
         )
         return True
 
-    return _write(operation)
+    # READ COMMITTED: sin bloqueos de hueco en despachos/despacho_unidades que choquen con
+    # add_unit_to_draft de otro incidente (mismo criterio que la activación)
+    return _write(operation, isolation="READ COMMITTED")

@@ -574,9 +574,9 @@ def cancel_dispatch_draft(dispatch_id, reason, user_id):
 
 
 def _expect_one_row(cursor, label):
-    """Fuerza el rollback si un UPDATE de la activación no cambió exactamente una fila."""
+    """Fuerza el rollback si un UPDATE de la operación no cambió exactamente una fila."""
     if cursor.rowcount != 1:
-        raise RuntimeError(f"La activación no pudo actualizar la fila de {label}.")
+        raise RuntimeError(f"La operación no pudo actualizar la fila de {label}.")
 
 
 def _audit_incident(cursor, user_id, incident_id, detail):
@@ -777,7 +777,7 @@ _TRANSITIONS = {
 }
 _ACTIVE_DISPATCH_MESSAGE = "Solo se pueden operar unidades de un despacho en estado Activo."
 _RETURN_DISPATCH_MESSAGE = (
-    "Solo se puede cerrar el regreso de unidades de un despacho Activo o Completado."
+    "Solo se puede cerrar el regreso de unidades de un despacho Activo, Completado o Cancelado."
 )
 
 
@@ -882,7 +882,7 @@ def _operate_unit(kind, dispatch_id, unit_id, user_id):
         cursor.execute(dispatch_query, (dispatch_id,))
         dispatch_state = cursor.fetchone()["state_code"]
         if returning_done:
-            allowed = (ACTIVATED_STATE_CODE, "COMPLETADO")
+            allowed = (ACTIVATED_STATE_CODE, COMPLETED_STATE_CODE, CANCELLED_STATE_CODE)
         else:
             allowed = (ACTIVATED_STATE_CODE,)
         if dispatch_state not in allowed:
@@ -915,9 +915,12 @@ def _operate_unit(kind, dispatch_id, unit_id, user_id):
         if part is None:
             raise DispatchUnitNotFoundError("La unidad no pertenece a este despacho.")
         if returning_done:
-            if part["fecha_liberacion"] is None or part["fecha_cancelacion"] is not None:
+            # Terminada por liberación normal o por cancelación (nunca ambas por CHECK)
+            terminated = part["fecha_asignacion"] is not None and (
+                part["fecha_liberacion"] is not None or part["fecha_cancelacion"] is not None)
+            if not terminated:
                 raise NoActiveParticipationError(
-                    "La participación de la unidad no fue liberada en este despacho."
+                    "La participación de la unidad no fue liberada ni cancelada en este despacho."
                 )
         elif (part["fecha_asignacion"] is None or part["fecha_liberacion"] is not None
               or part["fecha_cancelacion"] is not None):
@@ -1004,3 +1007,133 @@ def start_unit_return(dispatch_id, unit_id, user_id):
 def mark_unit_available(dispatch_id, unit_id, user_id):
     """REGRESANDO -> DISPONIBLE sobre una participación ya liberada."""
     return _operate_unit("available", dispatch_id, unit_id, user_id)
+
+
+# Unidad de una participación cancelada: estado actual -> nuevo estado (máquina aprobada)
+_CANCEL_UNIT_TRANSITIONS = {
+    "DESPACHADA": "DISPONIBLE",
+    "EN_RUTA": "REGRESANDO",
+    "EN_ESCENA": "REGRESANDO",
+}
+
+
+def _collect_active_participations(cursor, dispatch_ids):
+    """Participaciones activas de los despachos (lectura actual), por despacho y unidad."""
+    if not dispatch_ids:
+        return []
+    placeholders = ", ".join(["%s"] * len(dispatch_ids))
+    cursor.execute(
+        f"SELECT id_despacho_unidad, id_despacho, id_unidad FROM despacho_unidades "
+        f"WHERE id_despacho IN ({placeholders}) AND " + ACTIVE_PARTICIPATION_PREDICATE
+        + " ORDER BY id_despacho, id_unidad FOR SHARE",
+        tuple(dispatch_ids),
+    )
+    return cursor.fetchall()
+
+
+def _lock_units_ascending(cursor, unit_ids):
+    """Bloquea las unidades por id ascendente; devuelve {id: fila}."""
+    unit_ids = sorted(set(unit_ids))
+    if not unit_ids:
+        return {}
+    placeholders = ", ".join(["%s"] * len(unit_ids))
+    cursor.execute(
+        f"""
+        SELECT u.id_unidad, u.codigo, s.codigo AS state_code
+        FROM unidades u
+        INNER JOIN estados_unidad s ON s.id_estado_unidad = u.id_estado_unidad
+        WHERE u.id_unidad IN ({placeholders})
+        ORDER BY u.id_unidad
+        FOR UPDATE OF u
+        """,
+        tuple(unit_ids),
+    )
+    return {row["id_unidad"]: row for row in cursor.fetchall()}
+
+
+def _cancel_active_dispatch_in_tx(cursor, dispatch_id, reason, moment, user_id,
+                                  participations=None, units=None):
+    """ACTIVO -> CANCELADO dentro de la transacción del llamador (sin commit).
+
+    El despacho debe estar ya bloqueado FOR UPDATE. Si el llamador ya reunió y
+    bloqueó las unidades (cancelación global del incidente) las pasa en
+    participations/units; si no, se reúnen aquí. Nunca completa el despacho.
+    """
+    if participations is None:
+        participations = _collect_active_participations(cursor, [dispatch_id])
+        units = _lock_units_ascending(cursor, [p["id_unidad"] for p in participations])
+    cancelled_id = _state_id_by_code(cursor, CANCELLED_STATE_CODE)
+    active_id = _state_id_by_code(cursor, ACTIVATED_STATE_CODE)
+    for part in participations:
+        if part["id_despacho"] != dispatch_id:
+            continue
+        # La participación queda cancelada (no liberada, por ck_du_liberacion_cancelacion_excluyentes)
+        cursor.execute(
+            "UPDATE despacho_unidades SET fecha_cancelacion = %s, motivo_cancelacion = %s "
+            "WHERE id_despacho_unidad = %s AND fecha_cancelacion IS NULL "
+            "AND fecha_liberacion IS NULL",
+            (moment, reason, part["id_despacho_unidad"]),
+        )
+        _expect_one_row(cursor, "participación")
+        unit = units[part["id_unidad"]]
+        target = _CANCEL_UNIT_TRANSITIONS.get(unit["state_code"])
+        if target is None:
+            continue
+        cursor.execute(
+            "UPDATE unidades SET id_estado_unidad = %s "
+            "WHERE id_unidad = %s AND id_estado_unidad = %s",
+            (_unit_state_id(cursor, target), part["id_unidad"],
+             _unit_state_id(cursor, unit["state_code"])),
+        )
+        _expect_one_row(cursor, "unidad")
+        _audit_unit(cursor, user_id, part["id_unidad"],
+                    f"{unit['state_code']} → {target} por cancelación del despacho #{dispatch_id}.")
+        unit["state_code"] = target
+    cursor.execute(
+        "UPDATE despachos SET id_estado_despacho = %s, fecha_cancelacion = %s, "
+        "motivo_cancelacion = %s WHERE id_despacho = %s AND id_estado_despacho = %s",
+        (cancelled_id, moment, reason, dispatch_id, active_id),
+    )
+    _expect_one_row(cursor, "despacho")
+    _audit(cursor, user_id, "CAMBIO_ESTADO", dispatch_id,
+           f"ACTIVO → CANCELADO. Motivo: {reason}")
+
+
+def cancel_active_dispatch(dispatch_id, reason, user_id):
+    """Cancela un despacho ACTIVO con motivo; False si no existe."""
+    _require_ids(dispatch_id=dispatch_id, user_id=user_id)
+    if not isinstance(reason, str):
+        raise InvalidDispatchDataError("El motivo de cancelación no es válido.")
+    reason = reason.strip()
+    if not reason or len(reason) > _MAX_REASON_LENGTH:
+        raise InvalidDispatchDataError("El motivo de cancelación no es válido.")
+
+    def operation(cursor):
+        cursor.execute(
+            "SELECT id_incidente FROM despachos WHERE id_despacho = %s", (dispatch_id,)
+        )
+        head = cursor.fetchone()
+        if head is None:
+            return False
+        # Orden de bloqueo: incidente (S, no se modifica) -> despacho (X) -> unidades por id
+        # -> participaciones; igual que la cancelación global del incidente
+        _lock_incident_shared(cursor, head["id_incidente"])
+        cursor.execute(
+            """
+            SELECT s.codigo AS state_code
+            FROM despachos d
+            INNER JOIN estados_despacho s ON s.id_estado_despacho = d.id_estado_despacho
+            WHERE d.id_despacho = %s
+            FOR UPDATE OF d
+            """,
+            (dispatch_id,),
+        )
+        if cursor.fetchone()["state_code"] != ACTIVATED_STATE_CODE:
+            raise DispatchStateError("Solo se puede cancelar con esta acción un despacho Activo.")
+        cursor.execute("SELECT NOW() AS moment")
+        moment = cursor.fetchone()["moment"]
+        _cancel_active_dispatch_in_tx(cursor, dispatch_id, reason, moment, user_id)
+        return True
+
+    # READ COMMITTED: sin bloqueos de hueco que choquen con add_unit_to_draft de otro despacho
+    return _write(operation, isolation="READ COMMITTED")

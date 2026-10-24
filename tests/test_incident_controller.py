@@ -396,7 +396,8 @@ class IncidentControllerTest(IncidentTestBase):
         self.assertEqual(ic.cancel_incident(iid, "x" * 250)["state_code"], "CANCELADO")
 
     def test_cancel_other_states_rejected(self):
-        for state in ("ASIGNADO", "EN_ATENCION", "CONTROLADO", "CERRADO", "CANCELADO"):
+        # ASIGNADO y EN_ATENCION sin control ya se pueden cancelar desde OBJ 14
+        for state in ("CONTROLADO", "CERRADO", "CANCELADO"):
             iid = self.insert_incident(suffix=state, state_code=state)
             before = self.row(iid)
             with self.assertRaises(ic.IncidentStateError, msg=state):
