@@ -8,6 +8,7 @@ from views.dispatch_view import DispatchView
 from views.incident_query_view import IncidentQueryView
 from views.incident_view import IncidentView
 from views.personnel_view import PersonnelView
+from views.report_view import ReportView
 from views.station_view import StationView
 from views.unit_view import UnitView
 from views.user_view import UserView
@@ -49,6 +50,8 @@ class MainView(ctk.CTk):
         self.dispatches_button = None
         self.dashboard_view = None
         self.dashboard_button = None
+        self.report_view = None
+        self.reports_button = None
 
         frame = ctk.CTkFrame(self)
         frame.pack(padx=30, pady=30)
@@ -118,8 +121,14 @@ class MainView(ctk.CTk):
                         frame, text="Dashboard", command=self.open_dashboard
                     )
                     self.dashboard_button.pack(padx=30, pady=4, anchor="w")
-                widget = ctk.CTkLabel(frame, text=f"{text}: {PENDING_NOTE}")
-                widget.pack(padx=30, pady=2, anchor="w")
+                    self.reports_button = ctk.CTkButton(
+                        frame, text="Reportes", command=self.open_reports
+                    )
+                    self.reports_button.pack(padx=30, pady=4, anchor="w")
+                    widget = self.reports_button
+                else:
+                    widget = ctk.CTkLabel(frame, text=f"{text}: {PENDING_NOTE}")
+                    widget.pack(padx=30, pady=2, anchor="w")
             self.access_widgets[permission] = widget
         self.granted_permissions = frozenset(self.access_widgets)
 
@@ -208,6 +217,14 @@ class MainView(ctk.CTk):
             return self.dashboard_view
         self.dashboard_view = DashboardView(self)
         return self.dashboard_view
+
+    def open_reports(self):
+        """Abre los reportes; si ya están abiertos, los trae al frente."""
+        if self.report_view is not None and self.report_view.winfo_exists():
+            self.report_view.lift()
+            return self.report_view
+        self.report_view = ReportView(self)
+        return self.report_view
 
     def logout(self):
         """Limpia la sesión y pide volver al login."""

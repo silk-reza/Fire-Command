@@ -273,7 +273,7 @@ source .venv/bin/activate
 Durante la etapa actual deben estar disponibles, como mínimo, las dependencias usadas por la conexión y las previstas para autenticación/interfaz:
 
 ```bash
-python -m pip install customtkinter mysql-connector-python bcrypt python-dotenv Pillow
+python -m pip install customtkinter mysql-connector-python bcrypt python-dotenv Pillow reportlab
 ```
 
 Antes de la entrega se consolidará un `requirements.txt` con las versiones realmente utilizadas. Las dependencias opcionales de reportería o mapa, como `matplotlib`, `reportlab` o `tkintermapview`, se añadirán únicamente cuando esos módulos se incorporen.

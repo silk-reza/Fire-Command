@@ -242,12 +242,12 @@ class MainViewDashboardTest(unittest.TestCase):
                 module.back_button.invoke()
                 main.update()
                 self.assertFalse(module.winfo_exists())
-                # Reportes y Bitácora siguen como etiquetas pendientes
+                # Reportes ya es un módulo real; Bitácora sigue como etiqueta pendiente
                 labels = [
                     w.cget("text") for w in main.winfo_children()[0].winfo_children()
                     if isinstance(w, ctk.CTkLabel)
                 ]
-                self.assertTrue([t for t in labels if t.startswith("Reportes")])
+                self.assertFalse([t for t in labels if t.startswith("Reportes")])
                 main.destroy()
                 session.end_session()
 
