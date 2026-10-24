@@ -1265,6 +1265,136 @@ class DispatchViewTest(DispatchTestBase):
         self.assertEqual(str(view.cancel_button.cget("state")), "disabled")
         self.assertEqual(str(view.save_button.cget("state")), "disabled")
 
+    def recommendations_text(self, view):
+        return view.recommendations_text.get("1.0", "end-1c")
+
+    def seed_incident_types(self):
+        """Tipos de incidente de la semilla con recomendaciones distintas entre sí."""
+        _login("admin.demo")
+        found = {}
+        for (type_id,) in db_all(
+                "SELECT id_tipo_incidente FROM tipos_incidente WHERE nombre NOT LIKE 'TIT-%' "
+                "AND activo = 1 ORDER BY id_tipo_incidente"):
+            incident_id = self.insert_incident(f"Q{type_id}", tipo=type_id)
+            rows = dispatch_controller.get_unit_recommendations(incident_id)
+            if rows:
+                found.setdefault(tuple(r["unit_type_name"] for r in rows), (type_id, incident_id, rows))
+        session.end_session()
+        return list(found.values())
+
+    def draft_for(self, incident_id):
+        return self.add_dispatch(incident_id, "CREADO")
+
+    def test_recommendations_follow_selected_dispatch(self):
+        options = self.seed_incident_types()
+        self.assertGreaterEqual(len(options), 2)
+        (first_type, first_incident, first_rows), (second_type, second_incident, second_rows) = (
+            options[0], options[1])
+        first = self.draft_for(first_incident)
+        second = self.draft_for(second_incident)
+        view = self.open_view("operador.central")
+        self.assertEqual(self.recommendations_text(view), dispatch_view.RECOMMENDATIONS_PLACEHOLDER)
+        self.select_dispatch(view, first)
+        first_text = self.recommendations_text(view)
+        self.assertTrue(first_text.startswith("1. "))
+        self.assertIn(first_rows[0]["unit_type_name"], first_text.splitlines()[0])
+        for index, row in enumerate(first_rows, start=1):
+            self.assertIn(f"{index}. {row['unit_type_name']}", first_text)
+        self.select_dispatch(view, second)
+        second_text = self.recommendations_text(view)
+        self.assertIn(second_rows[0]["unit_type_name"], second_text.splitlines()[0])
+        self.assertNotEqual(first_text, second_text)
+        # La pestaña no cambia sola a Recomendaciones
+        self.assertNotEqual(view.side_tabs.get(), dispatch_view.TAB_RECOMMENDATIONS)
+        # El texto es de solo lectura
+        self.assertEqual(str(view.recommendations_text.cget("state")), "disabled")
+        # Un despacho terminal también muestra la guía del incidente
+        done = self.add_dispatch(first_incident, "CANCELADO")
+        view.refresh_list()
+        self.select_dispatch(view, done)
+        self.assertEqual(self.recommendations_text(view), first_text)
+
+    def test_recommendations_empty_zero_and_notes_formats(self):
+        incident_id = self.insert_incident("E")
+        dispatch_id = self.draft_for(incident_id)
+        view = self.open_view("operador.central")
+        self.select_dispatch(view, dispatch_id)
+        rows = [
+            {"unit_type_id": 1, "unit_type_name": "Alfa", "priority": 1, "note": "Con nota",
+             "available_count": 0, "available_units": []},
+            {"unit_type_id": 2, "unit_type_name": "Beta", "priority": 2, "note": None,
+             "available_count": 1, "available_units": []},
+            {"unit_type_id": 3, "unit_type_name": "Gama", "priority": 3, "note": None,
+             "available_count": 2, "available_units": []},
+        ]
+        with mock.patch.object(dispatch_controller, "get_unit_recommendations",
+                               return_value=rows):
+            view.refresh_button.invoke()
+        self.assertEqual(self.recommendations_text(view), (
+            "1. Alfa — 0 disponibles\n    Con nota\n2. Beta — 1 disponible\n"
+            "3. Gama — 2 disponibles"))
+        with mock.patch.object(dispatch_controller, "get_unit_recommendations",
+                               return_value=[]):
+            view.refresh_button.invoke()
+        self.assertEqual(self.recommendations_text(view), dispatch_view.RECOMMENDATIONS_EMPTY)
+        self.assertEqual(
+            dispatch_view.RECOMMENDATIONS_EMPTY,
+            "Sin recomendaciones configuradas para este tipo de incidente.")
+
+    def test_recommendations_for_type_without_rules(self):
+        _login("admin.demo")
+        type_id = self.temp_type()
+        session.end_session()
+        incident_id = self.insert_incident("N", tipo=type_id)
+        dispatch_id = self.draft_for(incident_id)
+        view = self.open_view("operador.central")
+        self.select_dispatch(view, dispatch_id)
+        self.assertEqual(self.recommendations_text(view), dispatch_view.RECOMMENDATIONS_EMPTY)
+
+    def test_recommendations_read_only_user_and_refresh_requery(self):
+        options = self.seed_incident_types()
+        incident_id = options[0][1]
+        dispatch_id = self.draft_for(incident_id)
+        view = self.open_view("consulta.sur")
+        with mock.patch.object(
+                dispatch_controller, "get_unit_recommendations",
+                wraps=dispatch_controller.get_unit_recommendations) as spy:
+            self.select_dispatch(view, dispatch_id)
+            self.assertEqual(spy.call_count, 1)
+            self.assertTrue(self.recommendations_text(view).startswith("1. "))
+            view.refresh_button.invoke()
+            view.update()
+            self.assertEqual(spy.call_count, 2)
+        texts = set()
+
+        def walk(widget):
+            for child in widget.winfo_children():
+                if isinstance(child, ctk.CTkButton):
+                    texts.add(child.cget("text"))
+                walk(child)
+
+        walk(view)
+        self.assertEqual(texts, BUTTONS)
+        for name in WRITE_BUTTONS + ("cancel_dispatch_button", "failure_button",
+                                     "add_crew_button", "remove_crew_button"):
+            self.assertEqual(self.state(getattr(view, name)), "disabled", name)
+
+    def test_recommendations_service_error_is_generic(self):
+        incident_id = self.insert_incident("F")
+        dispatch_id = self.draft_for(incident_id)
+        view = self.open_view("operador.central")
+        error = DispatchServiceError("SELECT * FROM compatibilidad Traceback")
+        with mock.patch.object(dispatch_controller, "get_unit_recommendations",
+                               side_effect=error), \
+                self.assertLogs("views.dispatch_view", level="ERROR"):
+            self.select_dispatch(view, dispatch_id)
+        text = view.message_label.cget("text")
+        self.assertEqual(text, MSG_INTERNAL)
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("SELECT", text)
+        self.assertEqual(self.recommendations_text(view), dispatch_view.RECOMMENDATIONS_ERROR)
+        self.assertEqual(view.selected_id, dispatch_id)
+
     def test_refresh_keeps_selection_filters_and_typed_text(self):
         self.insert_incident("A")
         self.temp_unit(name="Alfa")

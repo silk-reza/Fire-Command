@@ -555,3 +555,15 @@ def list_available_crew_candidates(dispatch_id, unit_id):
         return dispatch_model.list_available_crew_candidates(dispatch_id, unit_id)
     except mysql.connector.Error as error:
         raise _technical_error() from error
+
+
+def get_unit_recommendations(incident_id):
+    """Tipos de unidad recomendados para el incidente y sus unidades disponibles."""
+    _require_read()
+    incident_id = _validate_id(incident_id, "incidente")
+    try:
+        return dispatch_model.get_unit_recommendations_for_incident(incident_id)
+    except _MODEL_DOMAIN_ERRORS as error:
+        raise _domain_error(error) from error
+    except mysql.connector.Error as error:
+        raise _technical_error() from error

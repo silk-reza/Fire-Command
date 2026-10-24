@@ -1499,3 +1499,57 @@ def remove_crew_member(dispatch_id, unit_id, personnel_id, user_id):
         return _clean_crew(cursor.fetchall())
 
     return _write(operation, isolation="READ COMMITTED")
+
+
+def get_unit_recommendations_for_incident(incident_id):
+    """Tipos de unidad recomendados para el incidente con sus unidades disponibles.
+
+    Solo lectura: sin bloqueos ni escrituras. Una consulta; incluye los tipos sin
+    unidades disponibles (available_count = 0). Lanza DispatchIncidentNotFoundError.
+    """
+    _require_ids(incident_id=incident_id)
+    rows = _fetch_all(
+        """
+        SELECT c.id_tipo_unidad AS unit_type_id, t.nombre AS unit_type_name,
+               c.prioridad_recomendacion AS priority, c.observacion AS note,
+               u.id_unidad AS unit_id, u.codigo AS unit_code,
+               e.id_estacion AS station_id, e.codigo AS station_code
+        FROM incidentes i
+        LEFT JOIN (compatibilidad_incidente_unidad c
+                   INNER JOIN tipos_unidad t ON t.id_tipo_unidad = c.id_tipo_unidad
+                                            AND t.activo = 1)
+               ON c.id_tipo_incidente = i.id_tipo_incidente AND c.activo = 1
+        LEFT JOIN (unidades u
+                   INNER JOIN estados_unidad s ON s.id_estado_unidad = u.id_estado_unidad
+                                              AND s.codigo = %s
+                   INNER JOIN estaciones e ON e.id_estacion = u.id_estacion AND e.activo = 1)
+               ON u.id_tipo_unidad = t.id_tipo_unidad AND u.activo = 1
+        WHERE i.id_incidente = %s
+        ORDER BY c.prioridad_recomendacion, t.nombre, t.id_tipo_unidad,
+                 e.codigo, u.codigo, u.id_unidad
+        """,
+        (AVAILABLE_UNIT_STATE_CODE, incident_id),
+    )
+    if not rows:
+        raise DispatchIncidentNotFoundError("El incidente no existe.")
+    recommendations = {}
+    for row in rows:
+        if row["unit_type_id"] is None:
+            continue
+        item = recommendations.get(row["unit_type_id"])
+        if item is None:
+            item = recommendations[row["unit_type_id"]] = {
+                "unit_type_id": row["unit_type_id"],
+                "unit_type_name": row["unit_type_name"],
+                "priority": row["priority"],
+                "note": row["note"],
+                "available_count": 0,
+                "available_units": [],
+            }
+        if row["unit_id"] is not None:
+            item["available_units"].append({
+                "unit_id": row["unit_id"], "code": row["unit_code"],
+                "station_id": row["station_id"], "station_code": row["station_code"],
+            })
+            item["available_count"] += 1
+    return list(recommendations.values())

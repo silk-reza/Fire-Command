@@ -519,8 +519,10 @@ class DispatchControllerTest(DispatchTestBase):
         self.assertIn("units", seed)
         self.assertEqual(seed["unit_count"], len(seed["units"]))
         self.assertTrue(any(d["dispatch_id"] == 1 for d in dc.list_draft_dispatches()))
-        self.assertEqual(len(dc.list_dispatches()) - len(
-            [d for d in dc.list_dispatches() if d["incident_code"].startswith("TIN-")]), 9)
+        # Los 9 despachos del seed deben seguir presentes; pueden existir otros válidos de uso manual
+        persistent_ids = {d["dispatch_id"] for d in dc.list_dispatches()
+                          if not d["incident_code"].startswith("TIN-")}
+        self.assertTrue(set(range(1, 10)).issubset(persistent_ids))
 
 
 if __name__ == "__main__":

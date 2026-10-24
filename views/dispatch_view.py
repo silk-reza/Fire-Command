@@ -50,6 +50,10 @@ CANCELLED_STATE = "CANCELADO"
 ACTIVE_STATE = "ACTIVO"
 TAB_AVAILABLE = "Unidades disponibles"
 TAB_CREW = "Tripulación"
+TAB_RECOMMENDATIONS = "Recomendaciones"
+RECOMMENDATIONS_PLACEHOLDER = "Seleccione un despacho para ver las recomendaciones."
+RECOMMENDATIONS_EMPTY = "Sin recomendaciones configuradas para este tipo de incidente."
+RECOMMENDATIONS_ERROR = "No se pudieron cargar las recomendaciones."
 CREW_EMPTY_TEXT = "Seleccione una unidad"
 MSG_NO_CANDIDATES = "No hay personal disponible para asignar."
 CREW_EDIT_STATE = "DESPACHADA"
@@ -294,6 +298,13 @@ class DispatchView(ctk.CTkToplevel):
         self.side_tabs.pack(side="left", fill="both")
         available_tab = self.side_tabs.add(TAB_AVAILABLE)
         crew_tab = self.side_tabs.add(TAB_CREW)
+        recommendations_tab = self.side_tabs.add(TAB_RECOMMENDATIONS)
+        # Solo lectura: guía configurada para el tipo del incidente, nunca filtra nada
+        self.recommendations_text = ctk.CTkTextbox(
+            recommendations_tab, width=440, height=115, wrap="word"
+        )
+        self.recommendations_text.pack()
+        self._set_recommendations(RECOMMENDATIONS_PLACEHOLDER)
         bar = ctk.CTkFrame(available_tab, fg_color="transparent")
         bar.pack(fill="x")
         self.unit_search_entry = ctk.CTkEntry(
@@ -648,12 +659,37 @@ class DispatchView(ctk.CTkToplevel):
             self.units_tree.selection_set(previous_unit[0])
         self.selected_state_code = dispatch["state_code"]
         self._load_crew()
+        self._load_recommendations(dispatch["incident_id"])
         if previous_state != dispatch["state_code"]:
             # Un borrador usa las unidades disponibles; el resto muestra la tripulación
             self.side_tabs.set(
                 TAB_AVAILABLE if dispatch["state_code"] == DRAFT_STATE else TAB_CREW
             )
         self._update_controls()
+
+    def _set_recommendations(self, text):
+        self.recommendations_text.configure(state="normal")
+        self.recommendations_text.delete("1.0", "end")
+        self.recommendations_text.insert("1.0", text)
+        self.recommendations_text.configure(state="disabled")
+
+    def _load_recommendations(self, incident_id):
+        """Una sola consulta por recarga; muestra la lista numerada o un aviso."""
+        ok, rows = self._run(dispatch_controller.get_unit_recommendations, incident_id)
+        if not ok:
+            self._set_recommendations(RECOMMENDATIONS_ERROR)
+            return
+        if not rows:
+            self._set_recommendations(RECOMMENDATIONS_EMPTY)
+            return
+        lines = []
+        for index, row in enumerate(rows, start=1):
+            count = row["available_count"]
+            noun = "disponible" if count == 1 else "disponibles"
+            lines.append(f"{index}. {row['unit_type_name']} — {count} {noun}")
+            if row.get("note"):
+                lines.append(f"    {row['note']}")
+        self._set_recommendations("\n".join(lines))
 
     def _load_crew(self):
         ok, crew = self._run(dispatch_controller.get_dispatch_crew, self.selected_id)
@@ -673,6 +709,7 @@ class DispatchView(ctk.CTkToplevel):
         self.units_tree.delete(*self.units_tree.get_children())
         self._units = {}
         self._crew = {}
+        self._set_recommendations(RECOMMENDATIONS_PLACEHOLDER)
         self.side_tabs.set(TAB_AVAILABLE)
         self.form_title.configure(text="Nuevo borrador")
         self.incident_label.configure(text="")
