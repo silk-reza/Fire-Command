@@ -3,6 +3,7 @@ import customtkinter as ctk
 from controllers import access_controller
 from utils import permissions as perm
 from utils import session
+from views.dashboard_view import DashboardView
 from views.dispatch_view import DispatchView
 from views.incident_query_view import IncidentQueryView
 from views.incident_view import IncidentView
@@ -46,6 +47,8 @@ class MainView(ctk.CTk):
         self.query_button = None
         self.dispatch_view = None
         self.dispatches_button = None
+        self.dashboard_view = None
+        self.dashboard_button = None
 
         frame = ctk.CTkFrame(self)
         frame.pack(padx=30, pady=30)
@@ -109,6 +112,12 @@ class MainView(ctk.CTk):
                 # Borradores de despacho: reemplaza la etiqueta pendiente
                 widget = self._ensure_dispatches_button(frame)
             else:
+                if permission == perm.PERMISSION_VIEW_REPORTS:
+                    # El dashboard es el primer informe real; Reportes sigue pendiente
+                    self.dashboard_button = ctk.CTkButton(
+                        frame, text="Dashboard", command=self.open_dashboard
+                    )
+                    self.dashboard_button.pack(padx=30, pady=4, anchor="w")
                 widget = ctk.CTkLabel(frame, text=f"{text}: {PENDING_NOTE}")
                 widget.pack(padx=30, pady=2, anchor="w")
             self.access_widgets[permission] = widget
@@ -191,6 +200,14 @@ class MainView(ctk.CTk):
             return self.dispatch_view
         self.dispatch_view = DispatchView(self)
         return self.dispatch_view
+
+    def open_dashboard(self):
+        """Abre el dashboard operativo; si ya está abierto, lo trae al frente."""
+        if self.dashboard_view is not None and self.dashboard_view.winfo_exists():
+            self.dashboard_view.lift()
+            return self.dashboard_view
+        self.dashboard_view = DashboardView(self)
+        return self.dashboard_view
 
     def logout(self):
         """Limpia la sesión y pide volver al login."""

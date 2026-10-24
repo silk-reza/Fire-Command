@@ -135,6 +135,15 @@ class UnitViewTest(UnitTestBase):
         session.end_session()
         return unit
 
+    SEED_CODES = {"B-01", "B-02", "B-03", "A-01", "A-02", "R-01", "R-02", "C-01",
+                  "HZ-01", "CM-01", "CM-02"}
+
+    def db_state_name(self, code):
+        """Estado operativo que la base tiene ahora para una unidad (puede cambiar con el uso)."""
+        return db_all(
+            "SELECT s.nombre FROM unidades u JOIN estados_unidad s "
+            "ON s.id_estado_unidad = u.id_estado_unidad WHERE u.codigo = %s", (code,))[0][0]
+
     def test_opening_lists_seed_units_for_admin_and_operator(self):
         for username in ("admin.demo", "operador.central"):
             with self.subTest(username=username):
@@ -143,14 +152,18 @@ class UnitViewTest(UnitTestBase):
                     [view.tree.heading(c, "text") for c in view.tree["columns"]],
                     ["Código", "Placa", "Nombre", "Estación", "Tipo", "Estado operativo", "Activo"],
                 )
+                # Las unidades semilla están por código; su estado se compara con la base
                 rows = self.rows(view)
-                self.assertEqual(len(rows), 11)
+                self.assertTrue(self.SEED_CODES <= {r[0] for r in rows})
                 b01 = self.row_for(view, "B-01")
-                self.assertEqual(b01[1:], (
-                    "BOM-001", "Autobomba Central 1", CENTRAL, "AUTOBOMBA", "Disponible", "Sí",
+                self.assertEqual(b01[1:5], (
+                    "BOM-001", "Autobomba Central 1", CENTRAL, "AUTOBOMBA",
                 ))
-                self.assertEqual(self.row_for(view, "CM-01")[5:], ("Fuera de servicio", "No"))
-                self.assertEqual(self.row_for(view, "R-02")[5], "En ruta")
+                self.assertEqual(b01[5], self.db_state_name("B-01"))
+                self.assertEqual(b01[6], "Sí")
+                self.assertEqual(self.row_for(view, "CM-01")[6], "No")
+                for code in ("CM-01", "R-02", "A-01"):
+                    self.assertEqual(self.row_for(view, code)[5], self.db_state_name(code))
                 self.assertEqual(view.station_filter.get(), ALL_STATIONS)
                 self.assertEqual(view.type_filter.get(), ALL_TYPES)
                 self.assertEqual(view.state_filter.get(), ALL_STATES)
@@ -172,6 +185,10 @@ class UnitViewTest(UnitTestBase):
         self.assertEqual(view.message_label.cget("text"), "")
 
     def test_filters_by_station_type_state_and_combinations(self):
+        # Unidades propias con estado conocido: no dependen del uso de las unidades semilla
+        free = self.make_unit("D1")
+        broken = self.make_unit("M1")
+        self.set_state(broken["unit_id"], "MANTENIMIENTO")
         view = self.open_units()
         self.assertEqual(
             list(view.station_filter.cget("values")), [ALL_STATIONS, CENTRAL, NORTE, SUR]
@@ -182,20 +199,42 @@ class UnitViewTest(UnitTestBase):
         self.assertEqual(len(list(view.state_filter.cget("values"))), 8)
         view.station_filter.set(NORTE)
         self.refresh(view)
-        self.assertEqual(len(self.rows(view)), 4)
+        norte_rows = self.rows(view)
+        self.assertTrue(norte_rows)
+        self.assertTrue(all(r[3] == NORTE for r in norte_rows))
+        self.assertIn("R-02", [r[0] for r in norte_rows])
         view.type_filter.set("RESCATE")
         self.refresh(view)
         self.assertEqual([r[0] for r in self.rows(view)], ["R-02"])
+
+        # Estado: las unidades temporales aparecen solo en su estado
         view.type_filter.set(ALL_TYPES)
         view.station_filter.set(ALL_STATIONS)
         view.state_filter.set("Disponible")
         self.refresh(view)
-        self.assertEqual(sorted(r[0] for r in self.rows(view)), ["A-02", "B-01", "B-02"])
-        view.type_filter.set("AUTOBOMBA")
-        view.station_filter.set(SUR)
+        codes = [r[0] for r in self.rows(view)]
+        self.assertIn(free["code"], codes)
+        self.assertNotIn(broken["code"], codes)
+        self.assertTrue(all(r[5] == "Disponible" for r in self.rows(view)))
+        view.state_filter.set("Mantenimiento")
         self.refresh(view)
-        self.assertEqual([r[0] for r in self.rows(view)], ["B-02"])
-        self.search(view, "A-02")
+        codes = [r[0] for r in self.rows(view)]
+        self.assertIn(broken["code"], codes)
+        self.assertNotIn(free["code"], codes)
+
+        # Combinación estación + tipo + estado con las unidades temporales
+        station_code = db_all("SELECT codigo FROM estaciones WHERE id_estacion = %s",
+                              (self.seed_station,))[0][0]
+        station_text = next(v for v in view.station_filter.cget("values")
+                            if v.startswith(station_code))
+        view.station_filter.set(station_text)
+        view.type_filter.set(self.type_text(self.seed_type))
+        view.state_filter.set("Disponible")
+        self.refresh(view)
+        codes = [r[0] for r in self.rows(view)]
+        self.assertIn(free["code"], codes)
+        self.assertNotIn(broken["code"], codes)
+        self.search(view, broken["code"])
         self.assertEqual(self.rows(view), [])
         view.clear_search_button.invoke()
         view.update()
@@ -204,7 +243,9 @@ class UnitViewTest(UnitTestBase):
             (view.station_filter.get(), view.type_filter.get(), view.state_filter.get()),
             (ALL_STATIONS, ALL_TYPES, ALL_STATES),
         )
-        self.assertEqual(len(self.rows(view)), 11)
+        codes = {r[0] for r in self.rows(view)}
+        self.assertTrue(self.SEED_CODES <= codes)
+        self.assertTrue({free["code"], broken["code"]} <= codes)
 
     def test_filter_combobox_command_refreshes_automatically(self):
         view = self.open_units()
