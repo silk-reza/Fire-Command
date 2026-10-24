@@ -26,7 +26,8 @@ AVAILABLE_TITLES = ["Código", "Nombre", "Tipo", "Estación", "Estado"]
 BUTTONS = {
     "Nuevo borrador", "Guardar cambios", "Agregar unidad", "Quitar unidad",
     "Cancelar borrador", "Cancelar despacho", "Activar despacho", "Refrescar", "Marcar en ruta",
-    "Marcar en escena", "Iniciar regreso", "Marcar disponible", "Reportar falla", "Limpiar selección", "Regresar",
+    "Marcar en escena", "Iniciar regreso", "Marcar disponible", "Reportar falla",
+    "Agregar personal", "Quitar personal", "Limpiar selección", "Regresar",
     "Quitar filtros", "Buscar", "Limpiar filtros",
 }
 ACTION_BUTTONS = ("en_route_button", "on_scene_button", "return_button", "available_button")
@@ -52,8 +53,25 @@ class DispatchViewTest(DispatchTestBase):
     def setUp(self):
         super().setUp()
         session.end_session()
+        self.person_prefix = f"TDP-{self.prefix[-8:]}"
+        self._person_counter = 0
+        self.crew_before = db_all("SELECT * FROM despacho_personal ORDER BY id_despacho_personal")
         self.root = ctk.CTk()
         self.windows = [self.root]
+
+    def cleanup_steps(self):
+        steps = [
+            ("DELETE FROM despacho_personal WHERE id_personal IN "
+             "(SELECT id_personal FROM personal WHERE codigo LIKE %s)",
+             (self.person_prefix + "%",)),
+            ("DELETE FROM despacho_personal WHERE id_despacho_unidad IN "
+             "(SELECT id_despacho_unidad FROM despacho_unidades WHERE id_unidad IN "
+             "(SELECT id_unidad FROM unidades WHERE codigo LIKE %s))",
+             (self.unit_prefix + "%",)),
+        ]
+        steps += super().cleanup_steps()
+        steps.append(("DELETE FROM personal WHERE codigo LIKE %s", (self.person_prefix + "%",)))
+        return steps
 
     def tearDown(self):
         for window in self.windows:
@@ -63,6 +81,9 @@ class DispatchViewTest(DispatchTestBase):
                 pass
         session.end_session()
         super().tearDown()
+        self.assertEqual(
+            db_all("SELECT * FROM despacho_personal ORDER BY id_despacho_personal"),
+            self.crew_before)
 
     def open_view(self, username="operador.central"):
         _login(username)
@@ -973,6 +994,277 @@ class DispatchViewTest(DispatchTestBase):
         self.assertNotIn("SELECT", text)
         self.assertEqual(self.unit_state(unit_id), "DESPACHADA")
 
+    def person(self, active=True):
+        self._person_counter += 1
+        n = self._person_counter
+        return db_exec(
+            "INSERT INTO personal (id_estacion, codigo, nombres, apellidos, cargo, activo) "
+            "VALUES (%s, %s, %s, %s, 'Bombero', %s)",
+            (self.seed_station, f"{self.person_prefix}-{n}", f"Nombre{n}", f"Apellido{n}",
+             1 if active else 0))
+
+    def temp_links(self):
+        return db_all(
+            "SELECT dp.id_despacho_personal, dp.id_despacho_unidad, dp.id_personal "
+            "FROM despacho_personal dp JOIN personal p ON p.id_personal = dp.id_personal "
+            "WHERE p.codigo LIKE %s ORDER BY dp.id_despacho_personal",
+            (self.person_prefix + "%",))
+
+    def crew_codes(self, view):
+        return [view.crew_tree.item(i, "values")[0] for i in view.crew_tree.get_children()]
+
+    def crew_state(self, view):
+        return (str(view.add_crew_button.cget("state")),
+                str(view.remove_crew_button.cget("state")))
+
+    def test_crew_buttons_enablement_matrix(self):
+        incident_id, (unit_id,), dispatch_id = self.active_dispatch_units(1)
+        first = self.person()
+        dispatch_controller.assign_crew_member(dispatch_id, unit_id, first)
+        view = self.open_view("operador.central")
+        self.assertEqual(self.crew_state(view), ("disabled", "disabled"))
+        self.open_unit(view, dispatch_id, unit_id)
+        self.assertEqual(self.crew_codes(view), [f"{self.person_prefix}-1"])
+        self.assertEqual(view.crew_label.cget("text"), "Tripulación: 1 / 4")
+        self.assertEqual(self.crew_state(view), ("normal", "disabled"))
+        view.crew_tree.selection_set(str(first))
+        view.update()
+        self.assertEqual(self.crew_state(view), ("normal", "normal"))
+        # Capacidad completa: no se puede agregar
+        db_exec("UPDATE unidades SET capacidad_personal = 1 WHERE id_unidad = %s", (unit_id,))
+        self.open_unit(view, dispatch_id, unit_id)
+        self.assertEqual(view.crew_label.cget("text"), "Tripulación: 1 / 1")
+        self.assertEqual(str(view.add_crew_button.cget("state")), "disabled")
+        # Sin capacidad definida siempre hay lugar
+        db_exec("UPDATE unidades SET capacidad_personal = NULL WHERE id_unidad = %s", (unit_id,))
+        self.open_unit(view, dispatch_id, unit_id)
+        self.assertEqual(view.crew_label.cget("text"), "Tripulación: 1")
+        self.assertEqual(str(view.add_crew_button.cget("state")), "normal")
+        # Congelada cuando la unidad ya salió
+        for state_code in ("EN_RUTA", "EN_ESCENA", "REGRESANDO"):
+            self.set_unit_state(unit_id, state_code)
+            self.open_unit(view, dispatch_id, unit_id)
+            view.crew_tree.selection_set(str(first))
+            view.update()
+            self.assertEqual(self.crew_state(view), ("disabled", "disabled"), state_code)
+            self.assertEqual(self.crew_codes(view), [f"{self.person_prefix}-1"])
+
+        # Despachos completado, cancelado y borrador: visible pero sin edición
+        for suffix, dispatch_state in (("B", "COMPLETADO"), ("C", "CANCELADO")):
+            other = self.insert_incident(suffix)
+            dispatch = self.add_dispatch(other, dispatch_state)
+            unit = self.temp_unit(state_code="DESPACHADA")
+            link = self.add_assigned_participation(dispatch, unit)
+            member = self.person()
+            db_exec("INSERT INTO despacho_personal (id_despacho_unidad, id_personal) "
+                    "VALUES (%s, %s)", (link, member))
+            self.open_unit(view, dispatch, unit)
+            self.assertEqual(len(view.crew_tree.get_children()), 1, dispatch_state)
+            view.crew_tree.selection_set(str(member))
+            view.update()
+            self.assertEqual(self.crew_state(view), ("disabled", "disabled"), dispatch_state)
+        draft_incident = self.insert_incident("D")
+        draft = self.add_dispatch(draft_incident, "CREADO")
+        draft_unit = self.temp_unit()
+        self.add_preselection(draft, draft_unit)
+        self.open_unit(view, draft, draft_unit)
+        self.assertEqual(self.crew_state(view), ("disabled", "disabled"))
+        view.close()
+        session.end_session()
+
+        # Solo lectura: la lista se ve pero no hay edición
+        self.set_unit_state(unit_id, "DESPACHADA")
+        reader = self.open_view("consulta.sur")
+        self.open_unit(reader, dispatch_id, unit_id)
+        self.assertEqual(self.crew_codes(reader), [f"{self.person_prefix}-1"])
+        reader.crew_tree.selection_set(str(first))
+        reader.update()
+        self.assertEqual(self.crew_state(reader), ("disabled", "disabled"))
+
+    def test_crew_add_and_remove_flow(self):
+        incident_id, (unit_id,), dispatch_id = self.active_dispatch_units(1)
+        first, second = self.person(), self.person()
+        view = self.open_view("operador.central")
+        self.open_unit(view, dispatch_id, unit_id)
+        seen = []
+
+        def pick(person_id):
+            def chooser(candidates):
+                seen.append([c["code"] for c in candidates])
+                return person_id
+            return chooser
+
+        with mock.patch.object(view, "choose_personnel", side_effect=pick(None)) as chooser:
+            view.add_crew_button.invoke()
+        self.assertTrue(chooser.called)
+        self.assertEqual(self.temp_links(), [])
+        for person_id in (first, second):
+            with mock.patch.object(view, "choose_personnel", side_effect=pick(person_id)):
+                view.add_crew_button.invoke()
+            view.update()
+            self.assertIn("Personal asignado", view.message_label.cget("text"))
+        self.assertIn(f"{self.person_prefix}-1", seen[0])
+        self.assertNotIn(f"{self.person_prefix}-1", seen[-1])
+        self.assertEqual(len(self.temp_links()), 2)
+        self.assertEqual(self.crew_codes(view), [f"{self.person_prefix}-1", f"{self.person_prefix}-2"])
+        self.assertEqual(view.crew_label.cget("text"), "Tripulación: 2 / 4")
+        self.assertEqual(view.units_tree.selection(), (str(unit_id),))
+
+        view.crew_tree.selection_set(str(first))
+        view.update()
+        with mock.patch.object(view, "confirm", return_value=False):
+            view.remove_crew_button.invoke()
+        self.assertEqual(len(self.temp_links()), 2)
+        with mock.patch.object(view, "confirm", return_value=True) as confirm:
+            view.remove_crew_button.invoke()
+        view.update()
+        self.assertIn(self.unit_code(1), confirm.call_args[0][0])
+        self.assertIn("Nombre1", confirm.call_args[0][0])
+        self.assertEqual(len(self.temp_links()), 1)
+        self.assertEqual(self.crew_codes(view), [f"{self.person_prefix}-2"])
+        self.assertEqual(view.crew_label.cget("text"), "Tripulación: 1 / 4")
+        self.assertEqual(self.state(view.remove_crew_button), "disabled")
+
+    def test_crew_candidates_empty_message(self):
+        incident_id, (unit_id,), dispatch_id = self.active_dispatch_units(1)
+        view = self.open_view("operador.central")
+        self.open_unit(view, dispatch_id, unit_id)
+        with mock.patch.object(dispatch_controller, "list_available_crew_candidates",
+                               return_value=[]), \
+                mock.patch.object(view, "choose_personnel") as chooser:
+            view.add_crew_button.invoke()
+        self.assertFalse(chooser.called)
+        self.assertEqual(view.message_label.cget("text"), "No hay personal disponible para asignar.")
+
+    def test_crew_raced_candidates_show_message_and_write_nothing(self):
+        incident_id, (unit_id, other_unit), dispatch_id = self.active_dispatch_units(2)
+        gone, busy = self.person(), self.person()
+        view = self.open_view("operador.central")
+        self.open_unit(view, dispatch_id, unit_id)
+
+        def inactive_chooser(candidates):
+            db_exec("UPDATE personal SET activo = 0 WHERE id_personal = %s", (gone,))
+            return gone
+
+        def busy_chooser(candidates):
+            dispatch_controller.assign_crew_member(dispatch_id, other_unit, busy)
+            return busy
+
+        for chooser in (inactive_chooser, busy_chooser):
+            before = len(self.temp_links())
+            with mock.patch.object(view, "choose_personnel", side_effect=chooser):
+                view.add_crew_button.invoke()
+            view.update()
+            text = view.message_label.cget("text")
+            self.assertNotEqual(text, "")
+            self.assertNotEqual(text, MSG_INTERNAL)
+            self.assertNotIn("Traceback", text)
+            self.assertEqual(view.message_label.cget("text_color"), dispatch_view.COLOR_ERROR)
+            self.assertEqual(
+                len(self.temp_links()), before + (1 if chooser is busy_chooser else 0))
+            self.assertEqual(self.crew_codes(view), [])
+        self.assertEqual(self.state(view.add_crew_button), "normal")
+
+    def test_crew_read_only_user_is_denied(self):
+        incident_id, (unit_id,), dispatch_id = self.active_dispatch_units(1)
+        member, candidate = self.person(), self.person()
+        dispatch_controller.assign_crew_member(dispatch_id, unit_id, member)
+        session.end_session()
+        view = self.open_view("consulta.sur")
+        self.open_unit(view, dispatch_id, unit_id)
+        view.crew_tree.selection_set(str(member))
+        view.update()
+        before = self.temp_links()
+        with mock.patch.object(view, "choose_personnel", return_value=candidate):
+            view.add_crew()
+        self.assertEqual(view.message_label.cget("text"), MSG_DENIED_WRITE)
+        with mock.patch.object(view, "confirm", return_value=True):
+            view.remove_crew()
+        self.assertEqual(view.message_label.cget("text"), MSG_DENIED_WRITE)
+        self.assertEqual(self.temp_links(), before)
+
+    def test_crew_service_error_is_generic(self):
+        incident_id, (unit_id,), dispatch_id = self.active_dispatch_units(1)
+        person = self.person()
+        view = self.open_view("operador.central")
+        self.open_unit(view, dispatch_id, unit_id)
+        error = DispatchServiceError("SELECT * FROM personal Traceback")
+        with mock.patch.object(dispatch_controller, "assign_crew_member", side_effect=error), \
+                mock.patch.object(view, "choose_personnel", return_value=person), \
+                self.assertLogs("views.dispatch_view", level="ERROR"):
+            view.add_crew_button.invoke()
+        text = view.message_label.cget("text")
+        self.assertEqual(text, MSG_INTERNAL)
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("SELECT", text)
+        self.assertEqual(self.temp_links(), [])
+
+    def test_incident_lifecycle_flow_through_incident_view(self):
+        incident_id, unit_id, dispatch_id = self.active_dispatch("A")
+        self.set_state(incident_id, "EN_ATENCION")
+        view = IncidentView(self.root)
+        view.update()
+        for iid in view.tree.get_children():
+            if view.tree.item(iid, "values")[0] == f"{self.prefix}-A":
+                view.tree.selection_set(iid)
+        view.update()
+
+        def states():
+            return tuple(str(b.cget("state")) for b in (
+                view.control_button, view.reactivate_button, view.close_incident_button))
+
+        self.assertEqual(states(), ("normal", "disabled", "disabled"))
+        with mock.patch.object(view, "confirm", return_value=False):
+            view.control_button.invoke()
+        self.assertEqual(self.state_of(incident_id), "EN_ATENCION")
+        with mock.patch.object(view, "confirm", return_value=True) as confirm:
+            view.control_button.invoke()
+        view.update()
+        self.assertIn("no cierra el incidente", confirm.call_args[0][0])
+        self.assertEqual(self.state_of(incident_id), "CONTROLADO")
+        self.assertEqual(view.state_label.cget("text"), "Estado actual: Controlado")
+        self.assertIn("Fecha de control", view.control_label.cget("text"))
+        self.assertEqual(view.closed_label.cget("text"), "")
+        control_date = db_all("SELECT fecha_control FROM incidentes WHERE id_incidente = %s",
+                              (incident_id,))[0][0]
+        self.assertEqual(states(), ("disabled", "normal", "normal"))
+
+        # Con una unidad operando se puede reactivar, pero no cerrar
+        with mock.patch.object(view, "confirm", return_value=True) as confirm:
+            view.close_incident_button.invoke()
+        self.assertIn("será definitivo", confirm.call_args[0][0])
+        self.assertEqual(self.state_of(incident_id), "CONTROLADO")
+        self.assertEqual(view.message_label.cget("text_color"), dispatch_view.COLOR_ERROR)
+        with mock.patch.object(view, "ask_reason", return_value=None), \
+                mock.patch.object(view, "confirm", return_value=True):
+            view.reactivate_button.invoke()
+        self.assertEqual(self.state_of(incident_id), "CONTROLADO")
+        with mock.patch.object(view, "ask_reason", return_value="Rebrote"), \
+                mock.patch.object(view, "confirm", return_value=True):
+            view.reactivate_button.invoke()
+        view.update()
+        self.assertEqual(self.state_of(incident_id), "EN_ATENCION")
+        self.assertEqual(view.state_label.cget("text"), "Estado actual: En atención")
+        self.assertEqual(
+            db_all("SELECT fecha_control FROM incidentes WHERE id_incidente = %s",
+                   (incident_id,))[0][0], control_date)
+        with mock.patch.object(view, "confirm", return_value=True):
+            view.control_button.invoke()
+        view.update()
+        self.assertEqual(self.state_of(incident_id), "CONTROLADO")
+
+        # Sin operaciones pendientes el cierre procede y es definitivo
+        dispatch_controller.report_unit_failure(dispatch_id, unit_id, "Avería")
+        with mock.patch.object(view, "confirm", return_value=True):
+            view.close_incident_button.invoke()
+        view.update()
+        self.assertEqual(self.state_of(incident_id), "CERRADO")
+        self.assertEqual(view.state_label.cget("text"), "Estado actual: Cerrado")
+        self.assertIn("Fecha de cierre", view.closed_label.cget("text"))
+        self.assertEqual(states(), ("disabled", "disabled", "disabled"))
+        self.assertEqual(str(view.cancel_button.cget("state")), "disabled")
+        self.assertEqual(str(view.save_button.cget("state")), "disabled")
+
     def test_refresh_keeps_selection_filters_and_typed_text(self):
         self.insert_incident("A")
         self.temp_unit(name="Alfa")
@@ -1145,7 +1437,7 @@ class DispatchViewTest(DispatchTestBase):
         walk(view)
         self.assertEqual(texts, BUTTONS)
         self.assertEqual(SOURCE.count('text="Activar despacho"'), 1)
-        for forbidden in ("Liberar", "tripulaci", "Mantenimiento", "Eliminar", "Completar"):
+        for forbidden in ("Liberar", "Mantenimiento", "Eliminar", "Completar"):
             self.assertNotIn(forbidden, SOURCE)
 
     def test_source_has_no_data_access_or_role_names(self):

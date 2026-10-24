@@ -467,3 +467,91 @@ def report_unit_failure(dispatch_id, unit_id, reason):
         raise _domain_error(error) from error
     except mysql.connector.Error as error:
         raise _technical_error() from error
+
+
+class CrewError(Exception):
+    """Base de los errores de tripulación; el mensaje es apto para mostrar."""
+
+
+class PersonnelNotFoundError(CrewError):
+    """El personal indicado no existe."""
+
+
+class PersonnelInactiveError(CrewError):
+    """El personal está inactivo."""
+
+
+class DuplicateCrewMemberError(CrewError):
+    """El personal ya integra la tripulación de esa unidad."""
+
+
+class PersonnelBusyError(CrewError):
+    """El personal ya integra otra participación activa."""
+
+
+class CrewCapacityError(CrewError):
+    """La unidad alcanzó su capacidad de personal."""
+
+
+class CrewMemberNotFoundError(CrewError):
+    """El personal no pertenece a la tripulación de esa unidad."""
+
+
+_CREW_ERRORS = (
+    (dispatch_model.PersonnelNotFoundError, PersonnelNotFoundError),
+    (dispatch_model.PersonnelInactiveError, PersonnelInactiveError),
+    (dispatch_model.DuplicateCrewMemberError, DuplicateCrewMemberError),
+    (dispatch_model.PersonnelBusyError, PersonnelBusyError),
+    (dispatch_model.CrewCapacityError, CrewCapacityError),
+    (dispatch_model.CrewMemberNotFoundError, CrewMemberNotFoundError),
+)
+
+
+def _crew_call(function, dispatch_id, unit_id, personnel_id):
+    _require_write()
+    dispatch_id = _validate_id(dispatch_id, "despacho")
+    unit_id = _validate_id(unit_id, "unidad")
+    personnel_id = _validate_id(personnel_id, "personal")
+    user_id = _session_user_id()
+    try:
+        return function(dispatch_id, unit_id, personnel_id, user_id)
+    except dispatch_model.CrewError as error:
+        for model_class, controller_class in _CREW_ERRORS:
+            if isinstance(error, model_class):
+                raise controller_class(str(error)) from error
+        raise CrewError(str(error)) from error
+    except _MODEL_DOMAIN_ERRORS as error:
+        raise _domain_error(error) from error
+    except mysql.connector.Error as error:
+        raise _technical_error() from error
+
+
+def assign_crew_member(dispatch_id, unit_id, personnel_id):
+    """Asigna personal a una unidad Despachada; devuelve la tripulación de la unidad."""
+    return _crew_call(dispatch_model.assign_crew_member, dispatch_id, unit_id, personnel_id)
+
+
+def remove_crew_member(dispatch_id, unit_id, personnel_id):
+    """Retira personal de una unidad Despachada; devuelve la tripulación de la unidad."""
+    return _crew_call(dispatch_model.remove_crew_member, dispatch_id, unit_id, personnel_id)
+
+
+def get_dispatch_crew(dispatch_id):
+    """Tripulación del despacho agrupada por unidad {unit_id: [miembros]} (incluye históricos)."""
+    _require_read()
+    dispatch_id = _validate_id(dispatch_id, "despacho")
+    try:
+        return dispatch_model.get_dispatch_crew(dispatch_id)
+    except mysql.connector.Error as error:
+        raise _technical_error() from error
+
+
+def list_available_crew_candidates(dispatch_id, unit_id):
+    """Personal activo y libre que puede sumarse a la tripulación de la unidad."""
+    _require_read()
+    dispatch_id = _validate_id(dispatch_id, "despacho")
+    unit_id = _validate_id(unit_id, "unidad")
+    try:
+        return dispatch_model.list_available_crew_candidates(dispatch_id, unit_id)
+    except mysql.connector.Error as error:
+        raise _technical_error() from error

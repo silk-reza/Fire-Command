@@ -612,6 +612,124 @@ class IncidentViewTest(IncidentTestBase):
                 main.destroy()
                 session.end_session()
 
+    def lifecycle_states(self, view):
+        return (self.button_state(view.control_button),
+                self.button_state(view.reactivate_button),
+                self.button_state(view.close_incident_button))
+
+    def test_lifecycle_buttons_enablement_matrix(self):
+        states = ("REPORTADO", "ASIGNADO", "EN_ATENCION", "CONTROLADO", "CERRADO", "CANCELADO")
+        for state in states:
+            self.insert_incident(state, state_code=state)
+        expected = {
+            "EN_ATENCION": ("normal", "disabled", "disabled"),
+            "CONTROLADO": ("disabled", "normal", "normal"),
+        }
+        for username, writes in (("operador.central", True), ("consulta.sur", False)):
+            view = self.open_incidents(username)
+            self.assertEqual(self.lifecycle_states(view), ("disabled",) * 3)
+            self.assertEqual(view.control_button.cget("text"), "Marcar controlado")
+            self.assertEqual(view.reactivate_button.cget("text"), "Reactivar atención")
+            self.assertEqual(view.close_incident_button.cget("text"), "Cerrar incidente")
+            for state in states:
+                self.select(view, self.code(state))
+                want = expected.get(state, ("disabled",) * 3) if writes else ("disabled",) * 3
+                self.assertEqual(self.lifecycle_states(view), want, (username, state))
+            view.clear_button.invoke()
+            view.update()
+            self.assertEqual(self.lifecycle_states(view), ("disabled",) * 3)
+            view.close()
+            session.end_session()
+
+    def test_close_blocked_by_pending_dispatch(self):
+        view = None
+        for suffix, dispatch_state in (("D1", "CREADO"), ("D2", "ACTIVO")):
+            incident_id = self.insert_incident(suffix, state_code="CONTROLADO")
+            self.add_dispatch(incident_id, dispatch_state)
+            if view is None:
+                view = self.open_incidents("operador.central")
+            view.refresh_list()
+            self.select(view, self.code(suffix))
+            with mock.patch.object(view, "confirm", return_value=True):
+                view.close_incident_button.invoke()
+            view.update()
+            text = view.message_label.cget("text")
+            self.assertNotEqual(text, "")
+            self.assertNotEqual(text, incident_view.MSG_INTERNAL)
+            self.assertEqual(view.message_label.cget("text_color"), incident_view.COLOR_ERROR)
+            self.assertEqual(self.state_of(incident_id), "CONTROLADO", suffix)
+            self.assertEqual(view.state_label.cget("text"), "Estado actual: Controlado")
+
+    def test_reactivation_without_condition_and_reason_rules(self):
+        incident_id = self.insert_incident("R", state_code="CONTROLADO")
+        view = self.open_incidents("operador.central")
+        self.select(view, self.code("R"))
+        for reason in (None, ""):
+            with mock.patch.object(view, "ask_reason", return_value=reason) as ask, \
+                    mock.patch.object(view, "confirm", return_value=True):
+                view.reactivate_button.invoke()
+            self.assertIn("Motivo de la reactivación", ask.call_args[0][0])
+            self.assertIn("motivo es obligatorio", view.message_label.cget("text"))
+        with mock.patch.object(view, "ask_reason", return_value="   "), \
+                mock.patch.object(view, "confirm", return_value=True):
+            view.reactivate_button.invoke()
+        self.assertIn("motivo", view.message_label.cget("text"))
+        with mock.patch.object(view, "ask_reason", return_value="Rebrote"), \
+                mock.patch.object(view, "confirm", return_value=False):
+            view.reactivate_button.invoke()
+        with mock.patch.object(view, "ask_reason", return_value="Rebrote"), \
+                mock.patch.object(view, "confirm", return_value=True):
+            view.reactivate_button.invoke()
+        view.update()
+        self.assertIn("No se puede reactivar", view.message_label.cget("text"))
+        self.assertEqual(self.state_of(incident_id), "CONTROLADO")
+        self.assertEqual(self.audit_rows(incident_id), [])
+
+    def test_lifecycle_with_stale_state_reloads(self):
+        incident_id = self.insert_incident("S", state_code="EN_ATENCION")
+        view = self.open_incidents("operador.central")
+        self.select(view, self.code("S"))
+        self.set_state(incident_id, "CONTROLADO")
+        with mock.patch.object(view, "confirm", return_value=True):
+            view.control_button.invoke()
+        view.update()
+        self.assertEqual(view.message_label.cget("text_color"), incident_view.COLOR_ERROR)
+        self.assertNotEqual(view.message_label.cget("text"), incident_view.MSG_INTERNAL)
+        self.assertEqual(view.state_label.cget("text"), "Estado actual: Controlado")
+        self.assertEqual(self.lifecycle_states(view), ("disabled", "normal", "normal"))
+        self.assertEqual(self.state_of(incident_id), "CONTROLADO")
+
+    def test_lifecycle_forced_by_read_only_user_is_denied(self):
+        attention = self.insert_incident("A", state_code="EN_ATENCION")
+        controlled = self.insert_incident("C", state_code="CONTROLADO")
+        before = (self.row(attention), self.row(controlled))
+        view = self.open_incidents("consulta.sur")
+        for suffix, action in (("A", view.mark_controlled), ("C", view.close_incident),
+                               ("C", view.reactivate)):
+            self.select(view, self.code(suffix))
+            with mock.patch.object(view, "confirm", return_value=True), \
+                    mock.patch.object(view, "ask_reason", return_value="Rebrote"):
+                action()
+            self.assertEqual(view.message_label.cget("text"), incident_view.MSG_DENIED_WRITE)
+        self.assertEqual((self.row(attention), self.row(controlled)), before)
+
+    def test_lifecycle_service_error_is_generic(self):
+        from controllers import incident_controller
+        from controllers.incident_controller import IncidentServiceError
+        incident_id = self.insert_incident("E", state_code="EN_ATENCION")
+        view = self.open_incidents("operador.central")
+        self.select(view, self.code("E"))
+        error = IncidentServiceError("SELECT * FROM incidentes Traceback")
+        with mock.patch.object(incident_controller, "mark_incident_controlled", side_effect=error), \
+                mock.patch.object(view, "confirm", return_value=True), \
+                self.assertLogs("views.incident_view", level="ERROR"):
+            view.control_button.invoke()
+        text = view.message_label.cget("text")
+        self.assertEqual(text, incident_view.MSG_INTERNAL)
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("SELECT", text)
+        self.assertEqual(self.state_of(incident_id), "EN_ATENCION")
+
     def test_source_has_no_data_access_roles_or_state_controls(self):
         for forbidden in (
             "import mysql", "from mysql", "config.database", "from models", "import bcrypt",
@@ -619,7 +737,7 @@ class IncidentViewTest(IncidentTestBase):
             "delete_incident", "dispatch_controller", "reopen",
         ):
             self.assertNotIn(forbidden, SOURCE, forbidden)
-        for text in ("Eliminar", "Despachar", "Asignar", "Reabrir", "Cerrar incidente", "Controlar"):
+        for text in ("Eliminar", "Despachar", "Asignar", "Reabrir", "Controlar"):
             self.assertNotIn(f'text="{text}', SOURCE)
         self.assertNotIn("state_combo", SOURCE)
 

@@ -37,6 +37,7 @@ COLOR_WARNING = "#d97706"
 TERMINAL_STATES = ("CERRADO", "CANCELADO")
 CANCELLABLE_STATES = ("REPORTADO", "ASIGNADO")
 ATTENTION_STATE = "EN_ATENCION"
+CONTROLLED_STATE = "CONTROLADO"
 DESCRIPTION_LIMIT = 60
 
 COLUMNS = (
@@ -217,7 +218,11 @@ class IncidentView(ctk.CTkToplevel):
         self.registrar_label = ctk.CTkLabel(info, text="")
         self.registrar_label.pack(side="left", padx=(0, 24))
         self.reported_label = ctk.CTkLabel(info, text="")
-        self.reported_label.pack(side="left")
+        self.reported_label.pack(side="left", padx=(0, 24))
+        self.control_label = ctk.CTkLabel(info, text="")
+        self.control_label.pack(side="left", padx=(0, 24))
+        self.closed_label = ctk.CTkLabel(info, text="")
+        self.closed_label.pack(side="left")
         self.hint_label = ctk.CTkLabel(form, text="", text_color=COLOR_WARNING)
         self.hint_label.grid(row=7, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 4))
 
@@ -241,6 +246,15 @@ class IncidentView(ctk.CTkToplevel):
             bar, text="Cancelar incidente", width=140, fg_color="#b45309",
             hover_color="#92400e", command=self.cancel_incident,
         )
+        self.control_button = ctk.CTkButton(
+            bar, text="Marcar controlado", width=130, command=self.mark_controlled,
+        )
+        self.reactivate_button = ctk.CTkButton(
+            bar, text="Reactivar atención", width=130, command=self.reactivate,
+        )
+        self.close_incident_button = ctk.CTkButton(
+            bar, text="Cerrar incidente", width=120, command=self.close_incident,
+        )
         self.clear_button = ctk.CTkButton(
             bar, text="Limpiar", width=90, fg_color="gray40", hover_color="gray30",
             command=self.clear_form,
@@ -251,6 +265,7 @@ class IncidentView(ctk.CTkToplevel):
         )
         for button in (
             self.create_button, self.save_button, self.cancel_button,
+            self.control_button, self.reactivate_button, self.close_incident_button,
             self.clear_button, self.back_button,
         ):
             button.pack(side="left", padx=4)
@@ -266,7 +281,7 @@ class IncidentView(ctk.CTkToplevel):
     def ask_reason(self, prompt):
         """Pide el motivo de cancelación; devuelve None si se cierra el diálogo."""
         try:
-            dialog = ctk.CTkInputDialog(text=prompt, title="Cancelar incidente")
+            dialog = ctk.CTkInputDialog(text=prompt, title="Motivo")
             return dialog.get_input()
         finally:
             # El diálogo toma el grab y Tk no lo devuelve; se restablece el foco modal
@@ -442,6 +457,7 @@ class IncidentView(ctk.CTkToplevel):
         self.reported_label.configure(
             text=f"Fecha de reporte: {_format_date(incident['reported_at'])}"
         )
+        self._show_lifecycle_dates(incident)
         self._update_controls()
 
     def _entries(self):
@@ -503,6 +519,7 @@ class IncidentView(ctk.CTkToplevel):
         username = current["username"] if current else ""
         self.registrar_label.configure(text=f"Registrado por: {username}")
         self.reported_label.configure(text="")
+        self._show_lifecycle_dates(None)
         self._update_controls()
 
     def clear_form(self):
@@ -528,6 +545,15 @@ class IncidentView(ctk.CTkToplevel):
         self.create_button.configure(state="normal" if can_create else "disabled")
         self.save_button.configure(state="normal" if can_save else "disabled")
         self.cancel_button.configure(state="normal" if can_cancel else "disabled")
+        # Presentación: el controlador valida de nuevo el estado y las condiciones
+        usable = self.can_write and selected
+        self.control_button.configure(
+            state="normal" if usable and self.selected_state_code == ATTENTION_STATE
+            else "disabled"
+        )
+        controlled = usable and self.selected_state_code == CONTROLLED_STATE
+        self.reactivate_button.configure(state="normal" if controlled else "disabled")
+        self.close_incident_button.configure(state="normal" if controlled else "disabled")
         self.hint_label.configure(text=MSG_TERMINAL if terminal else "")
 
     def _form_data(self):
@@ -599,3 +625,67 @@ class IncidentView(ctk.CTkToplevel):
                 f"Incidente {incident['code']} cancelado correctamente. "
                 "Sus despachos en borrador y activos también quedaron cancelados."
             )
+
+    def _show_lifecycle_dates(self, incident):
+        """Muestra, solo cuando existen, las fechas de control y de cierre."""
+        controlled = incident.get("controlled_at") if incident else None
+        closed = incident.get("closed_at") if incident else None
+        self.control_label.configure(
+            text=f"Fecha de control: {_format_date(controlled)}" if controlled else ""
+        )
+        self.closed_label.configure(
+            text=f"Fecha de cierre: {_format_date(closed)}" if closed else ""
+        )
+
+    def mark_controlled(self):
+        code = self.code_entry.get()
+        message = (
+            f"¿Marcar el incidente {code} como controlado? Pasará a Controlado; "
+            "no cierra el incidente."
+        )
+        self._lifecycle(
+            incident_controller.mark_incident_controlled, message,
+            "Incidente {code} marcado como controlado.",
+        )
+
+    def reactivate(self):
+        if self.selected_id is None:
+            return
+        code = self.code_entry.get()
+        reason = self.ask_reason(f"Motivo de la reactivación del incidente {code}.")
+        if reason is None or reason == "":
+            self.show_message("No se reactivó el incidente: el motivo es obligatorio.", error=True)
+            return
+        message = f"¿Reactivar la atención del incidente {code}? Volverá a En atención."
+        self._lifecycle(
+            incident_controller.reactivate_incident, message,
+            "Incidente {code} reactivado: volvió a En atención.", reason,
+        )
+
+    def close_incident(self):
+        code = self.code_entry.get()
+        message = (
+            f"¿Cerrar el incidente {code}? Pasará a Cerrado y será definitivo: ya no podrá "
+            "modificarse, cancelarse ni reactivarse."
+        )
+        self._lifecycle(
+            incident_controller.close_incident, message, "Incidente {code} cerrado correctamente.",
+        )
+
+    def _lifecycle(self, function, confirmation, success_text, *extra):
+        if self.selected_id is None:
+            return
+        if not self.confirm(confirmation):
+            return
+        ok, incident = self._run(function, self.selected_id, *extra, write=True)
+        if ok:
+            self._load_incident(incident)
+            self.refresh_list()
+            self.show_message(success_text.format(code=incident["code"]))
+        elif self.selected_id is not None:
+            # El estado pudo cambiar: se relee el incidente sin tocar el mensaje de error
+            try:
+                self._load_incident(incident_controller.get_incident(self.selected_id))
+            except Exception:
+                pass
+            self.refresh_list()

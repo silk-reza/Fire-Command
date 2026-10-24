@@ -23,6 +23,7 @@ DRAFT_UNIT_KEYS = {
     "station_id", "station_code", "station_name", "station_active", "unit_active",
     "state_code", "state_name", "eligible_now", "assigned_at", "departed_at",
     "arrived_at", "released_at", "origin_station_code", "origin_station_name",
+    "crew_count", "capacity",
 }
 AVAILABLE_KEYS = {
     "unit_id", "unit_code", "unit_name", "plate", "type_id", "type_name", "station_id",
@@ -33,8 +34,9 @@ AVAILABLE_KEYS = {
 def function_body(source, name):
     """Texto de una función de nivel módulo hasta la siguiente definición."""
     start = source.index(chr(10) + "def " + name + "(")
-    end = source.find(chr(10) + "def ", start + 1)
-    return source[start:end if end != -1 else len(source)]
+    ends = [source.find(chr(10) + marker, start + 1) for marker in ("def ", "class ", "_", "# ")]
+    ends = [e for e in ends if e != -1]
+    return source[start:min(ends) if ends else len(source)]
 
 
 class DispatchModelTest(DispatchTestBase):
@@ -652,6 +654,17 @@ class DispatchModelTest(DispatchTestBase):
         self.assertNotIn("COMPLETED_STATE_CODE", cancel_helper)
         self.assertEqual(cancel_helper.count("_state_id_by_code(cursor, CANCELLED_STATE_CODE)"), 1)
         public_cancel = function_body(model_source, "cancel_active_dispatch")
+        # Tripulación (OBJ 16): únicas escrituras a despacho_personal; no tocan otras tablas
+        crew_functions = [function_body(model_source, name) for name in (
+            "_lock_crew_unit", "assign_crew_member", "remove_crew_member")]
+        crew_block = "".join(crew_functions)
+        for body in crew_functions:
+            self.assertEqual(body.count("UPDATE unidades") + body.count("UPDATE incidentes")
+                             + body.count("UPDATE despacho"), 0)
+        self.assertEqual(crew_functions[1].count("INSERT INTO despacho_personal"), 1)
+        self.assertEqual(crew_functions[2].count("DELETE FROM despacho_personal"), 1)
+        self.assertIn("WHERE id_despacho_personal = %s", crew_functions[2])
+        self.assertNotIn("DELETE", crew_functions[1])
         self.assertNotIn("UPDATE ", public_cancel.replace("FOR UPDATE", ""))
         # El helper de finalización: único UPDATE a COMPLETADO, llamado solo al iniciar regreso
         self.assertEqual(completion.count("UPDATE despachos"), 1)
@@ -684,7 +697,8 @@ class DispatchModelTest(DispatchTestBase):
         # Las constantes de activación solo aparecen en su definición
         for constant in ("ACTIVATED_STATE_CODE", "DISPATCHED_UNIT_STATE_CODE",
                          "INCIDENT_ASSIGNED_CODE"):
-            self.assertEqual(outside.replace(public_cancel, "").count(constant), 1, constant)
+            self.assertEqual(outside.replace(public_cancel, "").replace(crew_block, "").replace(
+                function_body(model_source, "list_available_crew_candidates"), "").count(constant), 1, constant)
         # Solo queda la definición de la constante con el literal ACTIVO
         self.assertEqual(outside.count('"ACTIVO"'), 1)
         self.assertNotIn("ACTIVO", controller_source)
@@ -695,7 +709,8 @@ class DispatchModelTest(DispatchTestBase):
         self.assertEqual(activation.count("SET id_estado_despacho"), 1)
         self.assertEqual(activation.count("INSERT INTO"), 0)
         self.assertEqual(sorted(re.findall(r"INSERT INTO (\w+)", model_source)),
-                         ["bitacora", "bitacora", "bitacora", "despacho_unidades", "despachos"])
+                         ["bitacora", "bitacora", "bitacora", "despacho_personal", "despacho_unidades",
+                          "despachos"])
         # Único INSERT en despachos usa el estado CREADO
         self.assertEqual(outside.count("_state_id_by_code(cursor, DRAFT_STATE_CODE)"), 1)
         # En la activación solo sirve como guarda del UPDATE (estado de origen)
@@ -705,7 +720,8 @@ class DispatchModelTest(DispatchTestBase):
         self.assertEqual(model_source.count("SET id_estado_despacho"), 4)
         self.assertEqual(outside.count("_state_id_by_code(cursor, CANCELLED_STATE_CODE)"), 1)
         self.assertEqual(model_source.count("UPDATE despachos"), 5)
-        self.assertEqual(model_source.count("DELETE"), 1)
+        # Dos borrados: la preselección de un borrador y el vínculo de tripulación (OBJ 16)
+        self.assertEqual(model_source.count("DELETE"), 2)
         delete_block = model_source[model_source.index("DELETE du FROM"):]
         delete_block = delete_block[:delete_block.index('"""')]
         self.assertIn("du.fecha_asignacion IS NULL", delete_block)

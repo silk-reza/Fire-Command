@@ -148,7 +148,10 @@ _DRAFT_UNIT_SELECT = """
            du.fecha_llegada_escena AS arrived_at,
            du.fecha_liberacion AS released_at,
            eo.codigo AS origin_station_code,
-           eo.nombre AS origin_station_name
+           eo.nombre AS origin_station_name,
+           (SELECT COUNT(*) FROM despacho_personal dp
+             WHERE dp.id_despacho_unidad = du.id_despacho_unidad) AS crew_count,
+           un.capacidad_personal AS capacity
     FROM despacho_unidades du
     INNER JOIN unidades un ON un.id_unidad = du.id_unidad
     INNER JOIN estaciones e ON e.id_estacion = un.id_estacion
@@ -288,6 +291,9 @@ def _translate_error(error):
         key = match.group(1).split(".")[-1] if match else ""
         if key == "uq_despacho_unidades_despacho_unidad":
             return DuplicateDraftUnitError("La unidad ya está preseleccionada en este despacho.")
+        if key == "uq_dp_despacho_unidad_personal":
+            return DuplicateCrewMemberError(
+                "El personal ya integra la tripulación de esta unidad.")
     if error.errno == 1452:
         return InvalidReferenceError("Una referencia del despacho no existe.")
     if error.errno in (3819, 1264, 1406):
@@ -1236,3 +1242,260 @@ def report_unit_failure(dispatch_id, unit_id, reason, user_id):
         return True
 
     return _write(operation)
+
+
+class CrewError(Exception):
+    """Base de los errores de tripulación."""
+
+
+class PersonnelNotFoundError(CrewError):
+    """El personal indicado no existe."""
+
+
+class PersonnelInactiveError(CrewError):
+    """El personal está inactivo."""
+
+
+class DuplicateCrewMemberError(CrewError):
+    """El personal ya integra la tripulación de esa unidad."""
+
+
+class PersonnelBusyError(CrewError):
+    """El personal ya integra otra participación activa."""
+
+
+class CrewCapacityError(CrewError):
+    """La unidad alcanzó su capacidad de personal."""
+
+
+class CrewMemberNotFoundError(CrewError):
+    """El personal no pertenece a la tripulación de esa unidad."""
+
+
+# Mismo predicado de participación activa, calificado con el alias du
+_DU_ACTIVE = ACTIVE_PARTICIPATION_PREDICATE.replace("fecha_", "du.fecha_")
+
+_CREW_SELECT = """
+    SELECT dp.id_despacho_personal AS crew_id,
+           du.id_unidad AS unit_id,
+           du.id_despacho_unidad AS dispatch_unit_id,
+           p.id_personal AS personnel_id,
+           p.codigo AS code,
+           p.nombres AS first_name,
+           p.apellidos AS last_name,
+           CONCAT(p.nombres, ' ', p.apellidos) AS full_name,
+           p.cargo AS role,
+           p.activo AS active,
+           p.id_estacion AS station_id,
+           e.codigo AS station_code,
+           dp.observaciones AS notes
+    FROM despacho_personal dp
+    INNER JOIN despacho_unidades du ON du.id_despacho_unidad = dp.id_despacho_unidad
+    INNER JOIN personal p ON p.id_personal = dp.id_personal
+    INNER JOIN estaciones e ON e.id_estacion = p.id_estacion
+    WHERE du.id_despacho = %s
+"""
+_CREW_ORDER = " ORDER BY du.id_unidad, p.apellidos, p.nombres, p.codigo"
+_CREW_FROZEN_MESSAGE = (
+    "La tripulación solo puede modificarse con el despacho Activo y la unidad Despachada."
+)
+
+
+def _clean_crew(rows):
+    for row in rows:
+        row["active"] = bool(row["active"])
+    return rows
+
+
+def get_dispatch_crew(dispatch_id):
+    """Tripulación del despacho agrupada por unidad {unit_id: [miembros]} en una consulta."""
+    rows = _clean_crew(_fetch_all(_CREW_SELECT + _CREW_ORDER, (dispatch_id,)))
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row["unit_id"], []).append(row)
+    return grouped
+
+
+def list_available_crew_candidates(dispatch_id, unit_id):
+    """Personal activo sin participación activa y que aún no está en esa unidad."""
+    return _fetch_all(
+        f"""
+        SELECT p.id_personal AS personnel_id, p.codigo AS code, p.nombres AS first_name,
+               p.apellidos AS last_name, CONCAT(p.nombres, ' ', p.apellidos) AS full_name,
+               p.cargo AS role, p.id_estacion AS station_id, e.codigo AS station_code
+        FROM personal p
+        INNER JOIN estaciones e ON e.id_estacion = p.id_estacion
+        WHERE p.activo = 1
+          AND NOT EXISTS (
+              SELECT 1 FROM despacho_personal dp
+              INNER JOIN despacho_unidades du ON du.id_despacho_unidad = dp.id_despacho_unidad
+              INNER JOIN despachos d ON d.id_despacho = du.id_despacho
+              INNER JOIN estados_despacho s ON s.id_estado_despacho = d.id_estado_despacho
+              WHERE dp.id_personal = p.id_personal AND {_DU_ACTIVE} AND s.codigo = %s)
+          AND NOT EXISTS (
+              SELECT 1 FROM despacho_personal dp2
+              INNER JOIN despacho_unidades du2
+                  ON du2.id_despacho_unidad = dp2.id_despacho_unidad
+              WHERE dp2.id_personal = p.id_personal AND du2.id_despacho = %s
+                AND du2.id_unidad = %s)
+        ORDER BY p.apellidos, p.nombres, p.codigo
+        """,
+        (ACTIVATED_STATE_CODE, dispatch_id, unit_id),
+    )
+
+
+def _lock_crew_unit(cursor, dispatch_id, unit_id):
+    """Bloquea despacho -> unidad -> participación y valida que la tripulación sea editable."""
+    cursor.execute("SELECT id_despacho FROM despachos WHERE id_despacho = %s", (dispatch_id,))
+    if cursor.fetchone() is None:
+        raise DispatchNotFoundError("El despacho no existe.")
+    cursor.execute(
+        """
+        SELECT s.codigo AS state_code
+        FROM despachos d
+        INNER JOIN estados_despacho s ON s.id_estado_despacho = d.id_estado_despacho
+        WHERE d.id_despacho = %s
+        FOR UPDATE OF d
+        """,
+        (dispatch_id,),
+    )
+    if cursor.fetchone()["state_code"] != ACTIVATED_STATE_CODE:
+        raise DispatchStateError(_CREW_FROZEN_MESSAGE)
+    cursor.execute(
+        """
+        SELECT u.codigo, u.capacidad_personal, s.codigo AS state_code
+        FROM unidades u
+        INNER JOIN estados_unidad s ON s.id_estado_unidad = u.id_estado_unidad
+        WHERE u.id_unidad = %s
+        FOR UPDATE OF u
+        """,
+        (unit_id,),
+    )
+    unit = cursor.fetchone()
+    if unit is None:
+        raise UnitNotFoundError("La unidad no existe.")
+    cursor.execute(
+        """
+        SELECT id_despacho_unidad, fecha_asignacion, fecha_liberacion, fecha_cancelacion
+        FROM despacho_unidades
+        WHERE id_despacho = %s AND id_unidad = %s
+        FOR UPDATE
+        """,
+        (dispatch_id, unit_id),
+    )
+    part = cursor.fetchone()
+    if part is None:
+        raise DispatchUnitNotFoundError("La unidad no pertenece a este despacho.")
+    if (part["fecha_asignacion"] is None or part["fecha_liberacion"] is not None
+            or part["fecha_cancelacion"] is not None):
+        raise NoActiveParticipationError(
+            "La unidad no tiene una participación activa en este despacho."
+        )
+    if unit["state_code"] != "DESPACHADA":
+        raise UnitStateError(_CREW_FROZEN_MESSAGE)
+    return unit, part["id_despacho_unidad"]
+
+
+def assign_crew_member(dispatch_id, unit_id, personnel_id, user_id):
+    """Asigna personal a una unidad Despachada; devuelve la tripulación de la unidad."""
+    _require_ids(dispatch_id=dispatch_id, unit_id=unit_id, personnel_id=personnel_id,
+                 user_id=user_id)
+
+    def operation(cursor):
+        unit, du_id = _lock_crew_unit(cursor, dispatch_id, unit_id)
+        # La fila del personal se bloquea para serializar asignaciones de la misma persona
+        cursor.execute(
+            "SELECT codigo, activo FROM personal WHERE id_personal = %s FOR UPDATE",
+            (personnel_id,),
+        )
+        person = cursor.fetchone()
+        if person is None:
+            raise PersonnelNotFoundError("El personal no existe.")
+        if not person["activo"]:
+            raise PersonnelInactiveError(
+                f"El personal {person['codigo']} está inactivo y no puede asignarse."
+            )
+        cursor.execute(
+            "SELECT 1 FROM despacho_personal WHERE id_despacho_unidad = %s "
+            "AND id_personal = %s",
+            (du_id, personnel_id),
+        )
+        if cursor.fetchone() is not None:
+            raise DuplicateCrewMemberError(
+                f"El personal {person['codigo']} ya integra la tripulación de esta unidad."
+            )
+        # Ocupación (lectura actual): otra participación activa en un despacho ACTIVO
+        cursor.execute(
+            f"""
+            SELECT un.codigo AS unit_code
+            FROM despacho_personal dp
+            INNER JOIN despacho_unidades du ON du.id_despacho_unidad = dp.id_despacho_unidad
+            INNER JOIN despachos d ON d.id_despacho = du.id_despacho
+            INNER JOIN estados_despacho s ON s.id_estado_despacho = d.id_estado_despacho
+            INNER JOIN unidades un ON un.id_unidad = du.id_unidad
+            WHERE dp.id_personal = %s AND {_DU_ACTIVE} AND s.codigo = %s
+            LIMIT 1
+            FOR SHARE OF dp
+            """,
+            (personnel_id, ACTIVATED_STATE_CODE),
+        )
+        busy = cursor.fetchone()
+        if busy is not None:
+            raise PersonnelBusyError(
+                f"El personal {person['codigo']} ya integra la unidad {busy['unit_code']} "
+                "en otra participación activa."
+            )
+        if unit["capacidad_personal"] is not None:
+            cursor.execute(
+                "SELECT COUNT(*) AS total FROM despacho_personal WHERE id_despacho_unidad = %s",
+                (du_id,),
+            )
+            if cursor.fetchone()["total"] + 1 > unit["capacidad_personal"]:
+                raise CrewCapacityError(
+                    f"La unidad {unit['codigo']} alcanzó su capacidad de "
+                    f"{unit['capacidad_personal']} integrantes."
+                )
+        cursor.execute(
+            "INSERT INTO despacho_personal (id_despacho_unidad, id_personal) VALUES (%s, %s)",
+            (du_id, personnel_id),
+        )
+        _audit(cursor, user_id, "MODIFICAR", dispatch_id,
+               f"Tripulación: asignado {person['codigo']} a unidad {unit['codigo']} "
+               f"(despacho #{dispatch_id}).")
+        cursor.execute(_CREW_SELECT + " AND du.id_unidad = %s" + _CREW_ORDER,
+                       (dispatch_id, unit_id))
+        return _clean_crew(cursor.fetchall())
+
+    return _write(operation, isolation="READ COMMITTED")
+
+
+def remove_crew_member(dispatch_id, unit_id, personnel_id, user_id):
+    """Retira un integrante de la tripulación; devuelve la tripulación de la unidad."""
+    _require_ids(dispatch_id=dispatch_id, unit_id=unit_id, personnel_id=personnel_id,
+                 user_id=user_id)
+
+    def operation(cursor):
+        unit, du_id = _lock_crew_unit(cursor, dispatch_id, unit_id)
+        cursor.execute(
+            "SELECT dp.id_despacho_personal, p.codigo FROM despacho_personal dp "
+            "INNER JOIN personal p ON p.id_personal = dp.id_personal "
+            "WHERE dp.id_despacho_unidad = %s AND dp.id_personal = %s FOR UPDATE OF dp",
+            (du_id, personnel_id),
+        )
+        link = cursor.fetchone()
+        if link is None:
+            raise CrewMemberNotFoundError("El personal no pertenece a la tripulación de la unidad.")
+        # Único borrado de tripulación: el vínculo de una unidad todavía Despachada
+        cursor.execute(
+            "DELETE FROM despacho_personal WHERE id_despacho_personal = %s",
+            (link["id_despacho_personal"],),
+        )
+        _expect_one_row(cursor, "tripulación")
+        _audit(cursor, user_id, "MODIFICAR", dispatch_id,
+               f"Tripulación: retirado {link['codigo']} de unidad {unit['codigo']} "
+               f"(despacho #{dispatch_id}).")
+        cursor.execute(_CREW_SELECT + " AND du.id_unidad = %s" + _CREW_ORDER,
+                       (dispatch_id, unit_id))
+        return _clean_crew(cursor.fetchall())
+
+    return _write(operation, isolation="READ COMMITTED")

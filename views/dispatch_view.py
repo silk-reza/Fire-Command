@@ -6,6 +6,7 @@ import customtkinter as ctk
 from controllers import dispatch_controller, access_controller
 from controllers.access_controller import AuthorizationDenied, NotAuthenticated
 from controllers.dispatch_controller import (
+    CrewError,
     DispatchHasNoUnitsError,
     DispatchIncidentNotFoundError,
     DispatchNotFoundError,
@@ -47,6 +48,11 @@ COLOR_WARNING = "#d97706"
 DRAFT_STATE = "CREADO"
 CANCELLED_STATE = "CANCELADO"
 ACTIVE_STATE = "ACTIVO"
+TAB_AVAILABLE = "Unidades disponibles"
+TAB_CREW = "Tripulación"
+CREW_EMPTY_TEXT = "Seleccione una unidad"
+MSG_NO_CANDIDATES = "No hay personal disponible para asignar."
+CREW_EDIT_STATE = "DESPACHADA"
 FAILURE_STATES = ("DESPACHADA", "EN_RUTA", "EN_ESCENA")
 COMPLETED_STATE = "COMPLETADO"
 # Solo presentación: cada estado real de la unidad habilita una única acción
@@ -79,6 +85,11 @@ DRAFT_UNIT_COLUMNS = (
     ("station", "Estación", 90),
     ("state", "Estado real", 80),
     ("mark", "Disponibilidad", 110),
+)
+CREW_COLUMNS = (
+    ("code", "Código", 80),
+    ("name", "Nombre", 220),
+    ("role", "Cargo", 140),
 )
 AVAILABLE_COLUMNS = (
     ("code", "Código", 70),
@@ -120,6 +131,7 @@ class DispatchView(ctk.CTkToplevel):
         self._loaded_observations = ""
         self._refreshing = False
         self._units = {}
+        self._crew = {}
         # Solo presentación: texto del selector -> id
         self._incident_options = {}
         self._filter_incidents = {}
@@ -276,13 +288,14 @@ class DispatchView(ctk.CTkToplevel):
         )
         self.failure_button.pack(side="left")
 
-        right = ctk.CTkFrame(container)
-        right.pack(side="left", fill="both")
-        ctk.CTkLabel(
-            right, text="Unidades disponibles", font=ctk.CTkFont(weight="bold")
-        ).pack(anchor="w", padx=8, pady=(4, 0))
-        bar = ctk.CTkFrame(right, fg_color="transparent")
-        bar.pack(fill="x", padx=8)
+        # Un solo panel lateral con pestañas: las unidades disponibles sirven al borrador
+        # y la tripulación al despacho activo, así la ventana no crece
+        self.side_tabs = ctk.CTkTabview(container, width=470, height=170)
+        self.side_tabs.pack(side="left", fill="both")
+        available_tab = self.side_tabs.add(TAB_AVAILABLE)
+        crew_tab = self.side_tabs.add(TAB_CREW)
+        bar = ctk.CTkFrame(available_tab, fg_color="transparent")
+        bar.pack(fill="x")
         self.unit_search_entry = ctk.CTkEntry(
             bar, width=90, placeholder_text="Código/nombre"
         )
@@ -305,8 +318,25 @@ class DispatchView(ctk.CTkToplevel):
             hover_color="gray30", command=self.clear_unit_filters,
         )
         self.clear_units_button.pack(side="left")
-        self.available_tree = self._make_tree(right, AVAILABLE_COLUMNS, 4)
-        self.available_tree.pack(padx=8, pady=(2, 8))
+        self.available_tree = self._make_tree(available_tab, AVAILABLE_COLUMNS, 4)
+        self.available_tree.pack(pady=(2, 0))
+
+        head = ctk.CTkFrame(crew_tab, fg_color="transparent")
+        head.pack(fill="x")
+        self.crew_label = ctk.CTkLabel(head, text=CREW_EMPTY_TEXT, width=150, anchor="w")
+        self.crew_label.pack(side="left")
+        self.add_crew_button = ctk.CTkButton(
+            head, text="Agregar personal", width=120, state="disabled", command=self.add_crew
+        )
+        self.add_crew_button.pack(side="left", padx=4)
+        self.remove_crew_button = ctk.CTkButton(
+            head, text="Quitar personal", width=110, state="disabled",
+            fg_color="#b45309", hover_color="#92400e", command=self.remove_crew,
+        )
+        self.remove_crew_button.pack(side="left")
+        self.crew_tree = self._make_tree(crew_tab, CREW_COLUMNS, 4)
+        self.crew_tree.pack(pady=(2, 0))
+        self.crew_tree.bind("<<TreeviewSelect>>", lambda event: self._update_crew_buttons())
 
     def _build_buttons(self):
         self.message_label = ctk.CTkLabel(self, text="", wraplength=1000, justify="left")
@@ -402,7 +432,7 @@ class DispatchView(ctk.CTkToplevel):
         except (
             DispatchStateError, UnitNotEligibleError, DuplicateDraftUnitError,
             DraftUnitNotFoundError, UnitNotFoundError, DispatchHasNoUnitsError,
-            IncidentTerminalError,
+            IncidentTerminalError, CrewError,
         ) as error:
             self.show_message(str(error), error=True)
             # Los datos en pantalla pudieron quedar desactualizados
@@ -580,6 +610,7 @@ class DispatchView(ctk.CTkToplevel):
     def _show_dispatch(self, dispatch, keep_text=False):
         """Muestra el detalle recién leído; keep_text conserva lo escrito sin guardar."""
         same = dispatch["dispatch_id"] == self.selected_id
+        previous_state = self.selected_state_code if same else None
         dirty = same and self._observations_value() != self._loaded_observations
         self.selected_id = dispatch["dispatch_id"]
         self.selected_state_code = dispatch["state_code"]
@@ -616,7 +647,17 @@ class DispatchView(ctk.CTkToplevel):
         if same and previous_unit and self.units_tree.exists(previous_unit[0]):
             self.units_tree.selection_set(previous_unit[0])
         self.selected_state_code = dispatch["state_code"]
+        self._load_crew()
+        if previous_state != dispatch["state_code"]:
+            # Un borrador usa las unidades disponibles; el resto muestra la tripulación
+            self.side_tabs.set(
+                TAB_AVAILABLE if dispatch["state_code"] == DRAFT_STATE else TAB_CREW
+            )
         self._update_controls()
+
+    def _load_crew(self):
+        ok, crew = self._run(dispatch_controller.get_dispatch_crew, self.selected_id)
+        self._crew = crew if ok else {}
 
     def _reset_form(self):
         self.selected_id = None
@@ -631,6 +672,8 @@ class DispatchView(ctk.CTkToplevel):
             self._refreshing = False
         self.units_tree.delete(*self.units_tree.get_children())
         self._units = {}
+        self._crew = {}
+        self.side_tabs.set(TAB_AVAILABLE)
         self.form_title.configure(text="Nuevo borrador")
         self.incident_label.configure(text="")
         self.incident_state_label.configure(text="")
@@ -672,6 +715,50 @@ class DispatchView(ctk.CTkToplevel):
             button.configure(state="normal" if on else "disabled")
         self.hint_label.configure(text=MSG_NOT_DRAFT if selected and not draft else "")
         self._update_unit_actions()
+        self._update_crew()
+
+    def _crew_editable(self, unit):
+        """Presentación: la tripulación solo se edita con la unidad recién Despachada."""
+        return bool(
+            unit is not None and self.can_write and self.selected_state_code == ACTIVE_STATE
+            and unit["state_code"] == CREW_EDIT_STATE
+            and unit.get("assigned_at") is not None and unit.get("released_at") is None
+        )
+
+    def _update_crew(self):
+        """Muestra la tripulación de la unidad elegida y recalcula sus botones."""
+        unit = self._selected_unit()
+        previous = self.crew_tree.selection()
+        self.crew_tree.delete(*self.crew_tree.get_children())
+        if unit is None:
+            self.crew_label.configure(text=CREW_EMPTY_TEXT)
+            self._update_crew_buttons()
+            return
+        for member in self._crew.get(unit["unit_id"], []):
+            self.crew_tree.insert("", "end", iid=str(member["personnel_id"]), values=(
+                member["code"], member["full_name"], member["role"] or "",
+            ))
+        if previous and self.crew_tree.exists(previous[0]):
+            self.crew_tree.selection_set(previous[0])
+        count = unit.get("crew_count", len(self.crew_tree.get_children()))
+        capacity = unit.get("capacity")
+        self.crew_label.configure(
+            text=f"Tripulación: {count}" if capacity is None
+            else f"Tripulación: {count} / {capacity}"
+        )
+        self._update_crew_buttons()
+
+    def _update_crew_buttons(self):
+        unit = self._selected_unit()
+        editable = self._crew_editable(unit)
+        room = False
+        if editable:
+            capacity = unit.get("capacity")
+            room = capacity is None or unit.get("crew_count", 0) < capacity
+        self.add_crew_button.configure(state="normal" if room else "disabled")
+        self.remove_crew_button.configure(
+            state="normal" if editable and self.crew_tree.selection() else "disabled"
+        )
 
     def _selected_unit(self):
         selection = self.units_tree.selection()
@@ -910,3 +997,91 @@ class DispatchView(ctk.CTkToplevel):
             if dispatch["state_code"] == COMPLETED_STATE:
                 text += " El despacho quedó finalizado."
             self.show_message(text)
+
+    def choose_personnel(self, candidates):
+        """Diálogo breve para elegir personal; devuelve su id o None. Se reemplaza en pruebas."""
+        options = {
+            f"{c['last_name']}, {c['first_name']} — {c['code']} ({c['role']})":
+            c["personnel_id"] for c in candidates
+        }
+        result = {"id": None}
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Agregar personal")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        combo = ctk.CTkComboBox(dialog, values=list(options), width=420, state="readonly")
+        combo.set(next(iter(options)))
+        combo.pack(padx=16, pady=(16, 8))
+
+        def accept():
+            result["id"] = options.get(combo.get())
+            dialog.destroy()
+
+        row = ctk.CTkFrame(dialog, fg_color="transparent")
+        row.pack(pady=(0, 14))
+        ctk.CTkButton(row, text="Aceptar", width=90, command=accept).pack(side="left", padx=4)
+        ctk.CTkButton(
+            row, text="Cancelar", width=90, fg_color="gray40", hover_color="gray30",
+            command=dialog.destroy,
+        ).pack(side="left", padx=4)
+        try:
+            dialog.update_idletasks()
+            dialog.grab_set()
+        except Exception:
+            pass
+        try:
+            self.wait_window(dialog)
+        finally:
+            # El diálogo toma el grab; se restablece el foco modal de la ventana
+            self._restore_modal()
+        return result["id"]
+
+    def add_crew(self):
+        unit = self._selected_unit()
+        if self.selected_id is None or unit is None:
+            self.show_message(MSG_SELECT_DRAFT_UNIT, error=True)
+            return
+        ok, candidates = self._run(
+            dispatch_controller.list_available_crew_candidates, self.selected_id,
+            unit["unit_id"],
+        )
+        if not ok:
+            return
+        if not candidates:
+            self.show_message(MSG_NO_CANDIDATES, error=True)
+            return
+        personnel_id = self.choose_personnel(candidates)
+        if personnel_id is None:
+            return
+        ok, _ = self._run(
+            dispatch_controller.assign_crew_member, self.selected_id, unit["unit_id"],
+            personnel_id, write=True,
+        )
+        if ok:
+            self._after_crew_change(f"Personal asignado a la unidad {unit['unit_code']}.")
+
+    def remove_crew(self):
+        unit = self._selected_unit()
+        if self.selected_id is None or unit is None:
+            self.show_message(MSG_SELECT_DRAFT_UNIT, error=True)
+            return
+        selection = self.crew_tree.selection()
+        if not selection:
+            self.show_message("Seleccione a la persona que desea quitar.", error=True)
+            return
+        name = self.crew_tree.item(selection[0], "values")[1]
+        if not self.confirm(f"¿Quitar a {name} de la tripulación de la unidad {unit['unit_code']}?"):
+            return
+        ok, _ = self._run(
+            dispatch_controller.remove_crew_member, self.selected_id, unit["unit_id"],
+            int(selection[0]), write=True,
+        )
+        if ok:
+            self._after_crew_change(f"Personal retirado de la unidad {unit['unit_code']}.")
+
+    def _after_crew_change(self, message):
+        ok, dispatch = self._run(dispatch_controller.get_dispatch, self.selected_id)
+        if ok:
+            self._show_dispatch(dispatch, keep_text=True)
+            self.refresh_list()
+            self.show_message(message)

@@ -22,6 +22,7 @@ DETAIL_KEYS = {
 MODEL_PUBLIC_FUNCTIONS = {
     "create_incident", "update_incident", "cancel_incident", "search_incidents",
     "get_incident", "list_incident_types", "list_priorities", "list_incident_states",
+    "mark_incident_controlled", "reactivate_incident", "close_incident",
 }
 
 

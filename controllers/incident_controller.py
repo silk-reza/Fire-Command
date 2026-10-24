@@ -416,3 +416,52 @@ def list_incident_states():
         return incident_model.list_incident_states()
     except mysql.connector.Error as error:
         raise _technical_error() from error
+
+
+class IncidentReactivationError(IncidentStateError):
+    """La reactivación no está justificada por recursos operando."""
+
+
+class IncidentCloseBlockedError(IncidentStateError):
+    """El cierre está bloqueado por despachos o participaciones pendientes."""
+
+
+def _lifecycle(function, incident_id, *args):
+    _require_write()
+    incident_id = _validate_id(incident_id, "incidente")
+    user_id = _session_user_id()
+    try:
+        if not function(incident_id, *args, user_id):
+            raise IncidentNotFoundError("El incidente no existe.")
+        return incident_model.get_incident(incident_id)
+    except incident_model.IncidentReactivationError as error:
+        raise IncidentReactivationError(str(error)) from error
+    except incident_model.IncidentCloseBlockedError as error:
+        raise IncidentCloseBlockedError(str(error)) from error
+    except _MODEL_DOMAIN_ERRORS as error:
+        raise _domain_error(error) from error
+    except mysql.connector.Error as error:
+        raise _technical_error() from error
+
+
+def mark_incident_controlled(incident_id):
+    """EN_ATENCION -> CONTROLADO; registra fecha_control."""
+    return _lifecycle(incident_model.mark_incident_controlled, incident_id)
+
+
+def reactivate_incident(incident_id, reason):
+    """CONTROLADO -> EN_ATENCION con motivo; exige un despacho activo con unidades operando."""
+    _require_write()
+    if not isinstance(reason, str) or not reason.strip():
+        raise IncidentValidationError("El motivo de reactivación es obligatorio.")
+    reason = reason.strip()
+    if len(reason) > _MAX_REASON_LENGTH:
+        raise IncidentValidationError(
+            f"El motivo de reactivación no puede superar {_MAX_REASON_LENGTH} caracteres."
+        )
+    return _lifecycle(incident_model.reactivate_incident, incident_id, reason)
+
+
+def close_incident(incident_id):
+    """CONTROLADO -> CERRADO sin despachos ni participaciones pendientes."""
+    return _lifecycle(incident_model.close_incident, incident_id)

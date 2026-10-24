@@ -495,3 +495,157 @@ def cancel_incident(incident_id, reason, user_id):
     # READ COMMITTED: sin bloqueos de hueco en despachos/despacho_unidades que choquen con
     # add_unit_to_draft de otro incidente (mismo criterio que la activación)
     return _write(operation, isolation="READ COMMITTED")
+
+
+class IncidentReactivationError(IncidentStateError):
+    """La reactivación no está justificada por recursos operando."""
+
+
+class IncidentCloseBlockedError(IncidentStateError):
+    """El cierre está bloqueado por despachos o participaciones pendientes."""
+
+
+# Participación activa (predicado compartido) calificada con el alias du
+_DU_ACTIVE = dispatch_model.ACTIVE_PARTICIPATION_PREDICATE.replace("fecha_", "du.fecha_")
+_CONTROLLED_CODE = "CONTROLADO"
+_IN_ATTENTION_CODE = "EN_ATENCION"
+_CLOSED_CODE = "CERRADO"
+
+
+def _check_ids(**ids):
+    for name, value in ids.items():
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise InvalidIncidentDataError(f"El identificador {name} no es válido.")
+
+
+def _guarded_state_update(cursor, incident_id, source_code, target_code, extra_sql, params):
+    """UPDATE del incidente solo si sigue en el estado esperado; exige una fila."""
+    cursor.execute(
+        f"UPDATE incidentes SET id_estado_incidente = %s{extra_sql} "
+        "WHERE id_incidente = %s AND id_estado_incidente = %s",
+        (_state_id_by_code(cursor, target_code), *params, incident_id,
+         _state_id_by_code(cursor, source_code)),
+    )
+    if cursor.rowcount != 1:
+        raise RuntimeError("No se pudo actualizar el estado del incidente.")
+
+
+def mark_incident_controlled(incident_id, user_id):
+    """EN_ATENCION -> CONTROLADO con fecha_control; False si no existe."""
+    _check_ids(incident_id=incident_id, user_id=user_id)
+
+    def operation(cursor):
+        current = _lock_incident(cursor, incident_id)
+        if current is None:
+            return False
+        if current["state_code"] != _IN_ATTENTION_CODE:
+            raise IncidentStateError(
+                "Solo se puede declarar bajo control un incidente En atención."
+            )
+        cursor.execute("SELECT NOW() AS moment")
+        moment = cursor.fetchone()["moment"]
+        # Un segundo control (tras reactivar) reemplaza la fecha anterior
+        _guarded_state_update(cursor, incident_id, _IN_ATTENTION_CODE, _CONTROLLED_CODE,
+                              ", fecha_control = %s", (moment,))
+        _audit(cursor, user_id, "CAMBIO_ESTADO", incident_id, "EN_ATENCION → CONTROLADO")
+        return True
+
+    return _write(operation)
+
+
+def reactivate_incident(incident_id, reason, user_id):
+    """CONTROLADO -> EN_ATENCION con motivo y recursos operando; False si no existe."""
+    _check_ids(incident_id=incident_id, user_id=user_id)
+    if not isinstance(reason, str):
+        raise InvalidIncidentDataError("El motivo de reactivación no es válido.")
+    reason = reason.strip()
+    if not reason or len(reason) > _MAX_REASON_LENGTH:
+        raise InvalidIncidentDataError("El motivo de reactivación no es válido.")
+
+    def operation(cursor):
+        current = _lock_incident(cursor, incident_id)
+        if current is None:
+            return False
+        if current["state_code"] != _CONTROLLED_CODE:
+            raise IncidentStateError("Solo se puede reactivar un incidente Controlado.")
+        # Condición genuina: algún despacho ACTIVO con una participación activa (lectura actual)
+        cursor.execute(
+            f"""
+            SELECT du.id_despacho_unidad
+            FROM despacho_unidades du
+            INNER JOIN despachos d ON d.id_despacho = du.id_despacho
+            INNER JOIN estados_despacho s ON s.id_estado_despacho = d.id_estado_despacho
+            WHERE d.id_incidente = %s AND s.codigo = %s AND {_DU_ACTIVE}
+            LIMIT 1
+            FOR SHARE OF du
+            """,
+            (incident_id, DISPATCH_ACTIVE_CODE),
+        )
+        if cursor.fetchone() is None:
+            raise IncidentReactivationError(
+                "No se puede reactivar: el incidente no tiene un despacho activo con "
+                "unidades operando."
+            )
+        # fecha_control, inicio de atención y cierre se conservan
+        _guarded_state_update(cursor, incident_id, _CONTROLLED_CODE, _IN_ATTENTION_CODE, "", ())
+        _audit(cursor, user_id, "CAMBIO_ESTADO", incident_id,
+               f"CONTROLADO → EN_ATENCION (reactivación): {reason}")
+        return True
+
+    # READ COMMITTED: las lecturas bloqueantes sobre despachos y participaciones del
+    # incidente no toman bloqueos de hueco que choquen con altas de otros incidentes
+    return _write(operation, isolation="READ COMMITTED")
+
+
+def close_incident(incident_id, user_id):
+    """CONTROLADO -> CERRADO con fecha_cierre; False si no existe."""
+    _check_ids(incident_id=incident_id, user_id=user_id)
+
+    def operation(cursor):
+        current = _lock_incident(cursor, incident_id)
+        if current is None:
+            return False
+        if current["state_code"] != _CONTROLLED_CODE:
+            raise IncidentStateError("Solo se puede cerrar un incidente Controlado.")
+        cursor.execute(
+            f"""
+            SELECT du.id_despacho_unidad
+            FROM despacho_unidades du
+            INNER JOIN despachos d ON d.id_despacho = du.id_despacho
+            INNER JOIN estados_despacho s ON s.id_estado_despacho = d.id_estado_despacho
+            WHERE d.id_incidente = %s AND s.codigo = %s AND {_DU_ACTIVE}
+            FOR SHARE OF du
+            """,
+            (incident_id, DISPATCH_ACTIVE_CODE),
+        )
+        if cursor.fetchall():
+            raise IncidentCloseBlockedError(
+                "No se puede cerrar: hay unidades con participación activa en el incidente."
+            )
+        cursor.execute(
+            """
+            SELECT s.codigo AS state_code
+            FROM despachos d
+            INNER JOIN estados_despacho s ON s.id_estado_despacho = d.id_estado_despacho
+            WHERE d.id_incidente = %s AND s.codigo IN (%s, %s)
+            FOR SHARE OF d
+            """,
+            (incident_id, DISPATCH_DRAFT_CODE, DISPATCH_ACTIVE_CODE),
+        )
+        pending = {row["state_code"] for row in cursor.fetchall()}
+        if DISPATCH_ACTIVE_CODE in pending:
+            raise IncidentCloseBlockedError(
+                "No se puede cerrar: el incidente tiene despachos activos pendientes."
+            )
+        if DISPATCH_DRAFT_CODE in pending:
+            raise IncidentCloseBlockedError(
+                "No se puede cerrar: el incidente tiene despachos en borrador pendientes."
+            )
+        cursor.execute("SELECT NOW() AS moment")
+        moment = cursor.fetchone()["moment"]
+        _guarded_state_update(cursor, incident_id, _CONTROLLED_CODE, _CLOSED_CODE,
+                              ", fecha_cierre = %s", (moment,))
+        _audit(cursor, user_id, "CAMBIO_ESTADO", incident_id, "CONTROLADO → CERRADO")
+        return True
+
+    return _write(operation, isolation="READ COMMITTED")
