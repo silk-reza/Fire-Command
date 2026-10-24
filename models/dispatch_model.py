@@ -9,6 +9,9 @@ DRAFT_STATE_CODE = "CREADO"
 CANCELLED_STATE_CODE = "CANCELADO"
 ACTIVATED_STATE_CODE = "ACTIVO"
 COMPLETED_STATE_CODE = "COMPLETADO"
+OUT_OF_SERVICE_UNIT_CODE = "FUERA_DE_SERVICIO"
+# Estados de unidad con participación en curso desde los que se admite una falla
+FAILURE_SOURCE_STATES = ("DESPACHADA", "EN_RUTA", "EN_ESCENA")
 # Participación activa (definición aprobada): asignada y sin liberar ni cancelar.
 # El despacho debe estar además en estado ACTIVO.
 ACTIVE_PARTICIPATION_PREDICATE = (
@@ -1137,3 +1140,99 @@ def cancel_active_dispatch(dispatch_id, reason, user_id):
 
     # READ COMMITTED: sin bloqueos de hueco que choquen con add_unit_to_draft de otro despacho
     return _write(operation, isolation="READ COMMITTED")
+
+
+def report_unit_failure(dispatch_id, unit_id, reason, user_id):
+    """Falla de una unidad con participación activa: la cancela y deja FUERA_DE_SERVICIO."""
+    _require_ids(dispatch_id=dispatch_id, unit_id=unit_id, user_id=user_id)
+    if not isinstance(reason, str):
+        raise InvalidDispatchDataError("El motivo de la falla no es válido.")
+    reason = reason.strip()
+    if not reason or len(reason) > _MAX_REASON_LENGTH:
+        raise InvalidDispatchDataError("El motivo de la falla no es válido.")
+
+    def operation(cursor):
+        cursor.execute("SELECT id_despacho FROM despachos WHERE id_despacho = %s", (dispatch_id,))
+        if cursor.fetchone() is None:
+            raise DispatchNotFoundError("El despacho no existe.")
+        # Orden de bloqueo: despacho (X, lo exige el cierre automático) -> unidad -> su
+        # participación; el incidente no se modifica y no se bloquea
+        cursor.execute(
+            """
+            SELECT s.codigo AS state_code
+            FROM despachos d
+            INNER JOIN estados_despacho s ON s.id_estado_despacho = d.id_estado_despacho
+            WHERE d.id_despacho = %s
+            FOR UPDATE OF d
+            """,
+            (dispatch_id,),
+        )
+        if cursor.fetchone()["state_code"] != ACTIVATED_STATE_CODE:
+            raise DispatchStateError(_ACTIVE_DISPATCH_MESSAGE)
+        cursor.execute(
+            """
+            SELECT u.codigo, s.codigo AS state_code, s.nombre AS state_name
+            FROM unidades u
+            INNER JOIN estados_unidad s ON s.id_estado_unidad = u.id_estado_unidad
+            WHERE u.id_unidad = %s
+            FOR UPDATE OF u
+            """,
+            (unit_id,),
+        )
+        unit = cursor.fetchone()
+        if unit is None:
+            raise UnitNotFoundError("La unidad no existe.")
+        cursor.execute(
+            """
+            SELECT id_despacho_unidad, fecha_asignacion, fecha_liberacion, fecha_cancelacion
+            FROM despacho_unidades
+            WHERE id_despacho = %s AND id_unidad = %s
+            FOR UPDATE
+            """,
+            (dispatch_id, unit_id),
+        )
+        part = cursor.fetchone()
+        if part is None:
+            raise DispatchUnitNotFoundError("La unidad no pertenece a este despacho.")
+        if (part["fecha_asignacion"] is None or part["fecha_liberacion"] is not None
+                or part["fecha_cancelacion"] is not None):
+            raise NoActiveParticipationError(
+                "La unidad no tiene una participación activa en este despacho."
+            )
+        if unit["state_code"] not in FAILURE_SOURCE_STATES:
+            raise UnitStateError(
+                f"La unidad {unit['codigo']} está en estado {unit['state_name']}; "
+                "solo puede reportarse falla estando Despachada, En ruta o En escena."
+            )
+        cursor.execute("SELECT NOW() AS moment")
+        moment = cursor.fetchone()["moment"]
+        # Participación cancelada (no liberada: ck_du_liberacion_cancelacion_excluyentes)
+        try:
+            cursor.execute(
+                "UPDATE despacho_unidades SET fecha_cancelacion = %s, motivo_cancelacion = %s "
+                "WHERE id_despacho_unidad = %s AND fecha_cancelacion IS NULL "
+                "AND fecha_liberacion IS NULL",
+                (moment, reason, part["id_despacho_unidad"]),
+            )
+        except mysql.connector.Error as error:
+            if error.errno == 3819:
+                raise OperationDatesError(
+                    "Las fechas de la participación no son coherentes."
+                ) from error
+            raise
+        _expect_one_row(cursor, "participación")
+        cursor.execute(
+            "UPDATE unidades SET id_estado_unidad = %s "
+            "WHERE id_unidad = %s AND id_estado_unidad = %s",
+            (_unit_state_id(cursor, OUT_OF_SERVICE_UNIT_CODE), unit_id,
+             _unit_state_id(cursor, unit["state_code"])),
+        )
+        _expect_one_row(cursor, "unidad")
+        _audit_unit(cursor, user_id, unit_id,
+                    f"{unit['state_code']} → {OUT_OF_SERVICE_UNIT_CODE} por falla "
+                    f"(despacho #{dispatch_id}): {reason}")
+        # Si era la última participación activa, el despacho se completa
+        _complete_dispatch_if_no_active_participations(cursor, dispatch_id, moment, user_id)
+        return True
+
+    return _write(operation)

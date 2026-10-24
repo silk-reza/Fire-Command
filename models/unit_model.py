@@ -9,6 +9,7 @@ BUSY_STATE_CODES = ("DESPACHADA", "EN_RUTA", "EN_ESCENA")
 
 INITIAL_STATE_CODE = "DISPONIBLE"
 OUT_OF_SERVICE_STATE_CODE = "FUERA_DE_SERVICIO"
+MAINTENANCE_STATE_CODE = "MANTENIMIENTO"
 ACTIVE_DISPATCH_CODE = "ACTIVO"
 
 
@@ -46,6 +47,10 @@ class InvalidUnitDataError(Exception):
 
 class UnitBusyError(Exception):
     """La unidad participa en una atención activa y no admite la operación."""
+
+
+class UnitTransitionError(Exception):
+    """La unidad no está en un estado que admita la transición pedida."""
 
 
 _UNIT_SELECT = """
@@ -385,6 +390,90 @@ def set_unit_active(unit_id, active, user_id):
                 "UPDATE unidades SET activo = 1, id_estado_unidad = %s WHERE id_unidad = %s",
                 (fds_id, unit_id),
             )
+        return True
+
+    return _write(operation)
+
+
+def _audit_unit_state(cursor, user_id, unit_id, detail):
+    cursor.execute(
+        """
+        INSERT INTO bitacora (id_usuario, accion, entidad, id_entidad, detalle)
+        VALUES (%s, 'CAMBIO_ESTADO', 'UNIDAD', %s, %s)
+        """,
+        (user_id, unit_id, detail),
+    )
+
+
+def _apply_service_transition(cursor, unit_id, source_code, target_code, user_id):
+    """UPDATE guardado de estado (bajo lock) y bitácora; falla si no cambia una fila."""
+    cursor.execute(
+        "UPDATE unidades SET id_estado_unidad = %s WHERE id_unidad = %s "
+        "AND id_estado_unidad = %s",
+        (_state_id_by_code(cursor, target_code), unit_id,
+         _state_id_by_code(cursor, source_code)),
+    )
+    if cursor.rowcount != 1:
+        raise RuntimeError("No se pudo actualizar el estado de la unidad.")
+    _audit_unit_state(cursor, user_id, unit_id, f"{source_code} → {target_code}.")
+
+
+def send_unit_to_maintenance(unit_id, user_id):
+    """DISPONIBLE -> MANTENIMIENTO; False si la unidad no existe."""
+
+    def operation(cursor):
+        current = _lock_unit(cursor, unit_id)
+        if current is None:
+            return False
+        if not current["activo"]:
+            raise UnitTransitionError("Una unidad inactiva no puede enviarse a mantenimiento.")
+        if current["state_code"] != INITIAL_STATE_CODE:
+            raise UnitTransitionError(
+                "Solo una unidad Disponible puede enviarse a mantenimiento "
+                f"(estado actual: {current['state_code']})."
+            )
+        if _has_active_participation(cursor, unit_id):
+            raise UnitBusyError(
+                "La unidad tiene una participación activa en un despacho "
+                "y no puede enviarse a mantenimiento."
+            )
+        _apply_service_transition(
+            cursor, unit_id, INITIAL_STATE_CODE, MAINTENANCE_STATE_CODE, user_id)
+        return True
+
+    return _write(operation)
+
+
+def return_unit_to_service(unit_id, user_id):
+    """MANTENIMIENTO o FUERA_DE_SERVICIO -> DISPONIBLE; nunca cambia activo."""
+
+    def operation(cursor):
+        current = _lock_unit(cursor, unit_id)
+        if current is None:
+            return False
+        if not current["activo"]:
+            raise UnitTransitionError(
+                "Una unidad inactiva no puede volver a servicio; reactívela primero."
+            )
+        if current["state_code"] not in (MAINTENANCE_STATE_CODE, OUT_OF_SERVICE_STATE_CODE):
+            raise UnitTransitionError(
+                "Solo una unidad en Mantenimiento o Fuera de servicio puede volver a "
+                f"servicio (estado actual: {current['state_code']})."
+            )
+        if _has_active_participation(cursor, unit_id):
+            raise UnitBusyError(
+                "La unidad tiene una participación activa en un despacho "
+                "y no puede volver a servicio."
+            )
+        try:
+            _ensure_station_active(cursor, current["id_estacion"])
+        except InactiveStationError:
+            raise UnitTransitionError(
+                "La estación de la unidad está inactiva; transfiera la unidad antes "
+                "de devolverla a servicio."
+            ) from None
+        _apply_service_transition(
+            cursor, unit_id, current["state_code"], INITIAL_STATE_CODE, user_id)
         return True
 
     return _write(operation)

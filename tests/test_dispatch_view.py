@@ -26,7 +26,7 @@ AVAILABLE_TITLES = ["Código", "Nombre", "Tipo", "Estación", "Estado"]
 BUTTONS = {
     "Nuevo borrador", "Guardar cambios", "Agregar unidad", "Quitar unidad",
     "Cancelar borrador", "Cancelar despacho", "Activar despacho", "Refrescar", "Marcar en ruta",
-    "Marcar en escena", "Iniciar regreso", "Marcar disponible", "Limpiar selección", "Regresar",
+    "Marcar en escena", "Iniciar regreso", "Marcar disponible", "Reportar falla", "Limpiar selección", "Regresar",
     "Quitar filtros", "Buscar", "Limpiar filtros",
 }
 ACTION_BUTTONS = ("en_route_button", "on_scene_button", "return_button", "available_button")
@@ -813,6 +813,166 @@ class DispatchViewTest(DispatchTestBase):
         self.assertEqual(str(view.cancel_button.cget("state")), "disabled")
         self.assertEqual(str(view.save_button.cget("state")), "disabled")
 
+    def active_dispatch_units(self, count=2, suffix="A"):
+        """Despacho ACTIVO con varias unidades DESPACHADA, creado por el controlador."""
+        _login("operador.central")
+        incident_id = self.insert_incident(suffix)
+        units = [self.temp_unit() for _ in range(count)]
+        draft = dispatch_controller.create_dispatch_draft({"incident_id": incident_id})
+        for unit in units:
+            dispatch_controller.add_unit_to_draft(draft["dispatch_id"], unit)
+        dispatch_controller.activate_dispatch(draft["dispatch_id"])
+        return incident_id, units, draft["dispatch_id"]
+
+    def failure_enabled(self, view):
+        return self.state(view.failure_button) == "normal"
+
+    def test_failure_button_enablement_matrix(self):
+        incident_id, units, dispatch_id = self.active_dispatch_units(1)
+        unit_id = units[0]
+        view = self.open_view("operador.central")
+        self.assertFalse(self.failure_enabled(view))
+        expected = {
+            "DESPACHADA": True, "EN_RUTA": True, "EN_ESCENA": True, "REGRESANDO": False,
+            "DISPONIBLE": False, "MANTENIMIENTO": False, "FUERA_DE_SERVICIO": False,
+        }
+        for state_code, enabled in expected.items():
+            self.set_unit_state(unit_id, state_code)
+            self.open_unit(view, dispatch_id, unit_id)
+            self.assertEqual(self.failure_enabled(view), enabled, state_code)
+        view.units_tree.selection_remove(*view.units_tree.selection())
+        view.update()
+        self.assertFalse(self.failure_enabled(view))
+
+        done_incident = self.insert_incident("B")
+        done = self.add_dispatch(done_incident, "COMPLETADO")
+        done_unit = self.temp_unit(state_code="EN_RUTA")
+        self.add_assigned_participation(done, done_unit)
+        self.open_unit(view, done, done_unit)
+        self.assertFalse(self.failure_enabled(view))
+        for suffix, state_code in (("C", "CREADO"), ("D", "CANCELADO")):
+            other = self.insert_incident(suffix)
+            dispatch = self.add_dispatch(other, state_code)
+            unit = self.temp_unit(state_code="EN_RUTA")
+            self.add_preselection(dispatch, unit)
+            self.open_unit(view, dispatch, unit)
+            self.assertFalse(self.failure_enabled(view), state_code)
+        view.close()
+        session.end_session()
+        reader = self.open_view("consulta.sur")
+        self.open_unit(reader, dispatch_id, unit_id)
+        self.set_unit_state(unit_id, "DESPACHADA")
+        self.open_unit(reader, dispatch_id, unit_id)
+        self.assertFalse(self.failure_enabled(reader))
+
+    def test_failure_flow_completes_dispatch_on_last_unit(self):
+        incident_id, (first, second), dispatch_id = self.active_dispatch_units(2)
+        view = self.open_view("operador.central")
+        self.open_unit(view, dispatch_id, first)
+        incident_label = view.incident_state_label.cget("text")
+        incident_state = self.state_of(incident_id)
+        out = self.unit_state_name("FUERA_DE_SERVICIO")
+        with mock.patch.object(view, "ask_reason", return_value="Avería de motor"), \
+                mock.patch.object(view, "confirm", return_value=True) as confirm:
+            view.failure_button.invoke()
+        view.update()
+        self.assertIn(self.unit_code(1), confirm.call_args[0][0])
+        self.assertIn("Fuera de servicio", confirm.call_args[0][0])
+        self.assertEqual(self.unit_state(first), "FUERA_DE_SERVICIO")
+        self.assertEqual(view.units_tree.item(str(first), "values")[4], out)
+        self.assertEqual(self.dispatch_state(dispatch_id), "ACTIVO")
+        self.assertIn("Activo", view.state_label.cget("text"))
+        self.assertEqual(view.incident_state_label.cget("text"), incident_label)
+        self.assertEqual(view.units_tree.selection(), (str(first),))
+        self.assertFalse(self.failure_enabled(view))
+        self.assertIn("Falla", view.message_label.cget("text"))
+
+        view.units_tree.selection_set(str(second))
+        view.update()
+        self.assertTrue(self.failure_enabled(view))
+        with mock.patch.object(view, "ask_reason", return_value="Otra avería"), \
+                mock.patch.object(view, "confirm", return_value=True):
+            view.failure_button.invoke()
+        view.update()
+        self.assertEqual(self.unit_state(second), "FUERA_DE_SERVICIO")
+        self.assertEqual(self.dispatch_state(dispatch_id), "COMPLETADO")
+        self.assertIn("Completado", view.state_label.cget("text"))
+        self.assertEqual(view.tree.item(str(dispatch_id), "values")[2], "Completado")
+        self.assertEqual(view.incident_state_label.cget("text"), incident_label)
+        self.assertEqual(self.state_of(incident_id), incident_state)
+        self.assertFalse(self.failure_enabled(view))
+        self.assertEqual(self.state(view.cancel_dispatch_button), "disabled")
+
+    def test_failure_without_reason_or_confirmation_changes_nothing(self):
+        incident_id, (unit_id,), dispatch_id = self.active_dispatch_units(1)
+        view = self.open_view("operador.central")
+        self.open_unit(view, dispatch_id, unit_id)
+        before = (self.preselections(dispatch_id), self.unit_row(unit_id),
+                  self.dispatch_row(dispatch_id), self.row(incident_id))
+        for reason in (None, ""):
+            with mock.patch.object(view, "ask_reason", return_value=reason), \
+                    mock.patch.object(view, "confirm", return_value=True):
+                view.failure_button.invoke()
+            self.assertIn("motivo es obligatorio", view.message_label.cget("text"))
+        with mock.patch.object(view, "ask_reason", return_value="   "), \
+                mock.patch.object(view, "confirm", return_value=True):
+            view.failure_button.invoke()
+        self.assertIn("motivo", view.message_label.cget("text"))
+        with mock.patch.object(view, "ask_reason", return_value="Avería"), \
+                mock.patch.object(view, "confirm", return_value=False):
+            view.failure_button.invoke()
+        self.assertEqual((self.preselections(dispatch_id), self.unit_row(unit_id),
+                          self.dispatch_row(dispatch_id), self.row(incident_id)), before)
+
+    def test_failure_read_only_user_is_denied(self):
+        incident_id, (unit_id,), dispatch_id = self.active_dispatch_units(1)
+        session.end_session()
+        view = self.open_view("consulta.sur")
+        self.open_unit(view, dispatch_id, unit_id)
+        before = (self.preselections(dispatch_id), self.unit_row(unit_id),
+                  self.dispatch_row(dispatch_id))
+        view.failure_button.configure(state="normal")
+        with mock.patch.object(view, "ask_reason", return_value="Avería"), \
+                mock.patch.object(view, "confirm", return_value=True):
+            view.report_failure()
+        self.assertEqual(view.message_label.cget("text"), MSG_DENIED_WRITE)
+        self.assertEqual((self.preselections(dispatch_id), self.unit_row(unit_id),
+                          self.dispatch_row(dispatch_id)), before)
+
+    def test_failure_with_stale_state_reloads(self):
+        incident_id, (unit_id,), dispatch_id = self.active_dispatch_units(1)
+        view = self.open_view("operador.central")
+        self.open_unit(view, dispatch_id, unit_id)
+        self.set_unit_state(unit_id, "REGRESANDO")
+        before = (self.preselections(dispatch_id), self.unit_row(unit_id),
+                  self.dispatch_row(dispatch_id))
+        with mock.patch.object(view, "ask_reason", return_value="Avería"), \
+                mock.patch.object(view, "confirm", return_value=True):
+            view.failure_button.invoke()
+        view.update()
+        text = view.message_label.cget("text")
+        self.assertNotEqual(text, "")
+        self.assertNotEqual(text, MSG_INTERNAL)
+        self.assertEqual((self.preselections(dispatch_id), self.unit_row(unit_id),
+                          self.dispatch_row(dispatch_id)), before)
+        self.assertFalse(self.failure_enabled(view))
+
+    def test_failure_service_error_is_generic(self):
+        incident_id, (unit_id,), dispatch_id = self.active_dispatch_units(1)
+        view = self.open_view("operador.central")
+        self.open_unit(view, dispatch_id, unit_id)
+        error = DispatchServiceError("SELECT * FROM unidades Traceback")
+        with mock.patch.object(dispatch_controller, "report_unit_failure", side_effect=error), \
+                mock.patch.object(view, "ask_reason", return_value="Avería"), \
+                mock.patch.object(view, "confirm", return_value=True), \
+                self.assertLogs("views.dispatch_view", level="ERROR"):
+            view.failure_button.invoke()
+        text = view.message_label.cget("text")
+        self.assertEqual(text, MSG_INTERNAL)
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("SELECT", text)
+        self.assertEqual(self.unit_state(unit_id), "DESPACHADA")
+
     def test_refresh_keeps_selection_filters_and_typed_text(self):
         self.insert_incident("A")
         self.temp_unit(name="Alfa")
@@ -985,7 +1145,7 @@ class DispatchViewTest(DispatchTestBase):
         walk(view)
         self.assertEqual(texts, BUTTONS)
         self.assertEqual(SOURCE.count('text="Activar despacho"'), 1)
-        for forbidden in ("Liberar", "tripulaci", "Falla", "Mantenimiento", "Eliminar", "Completar"):
+        for forbidden in ("Liberar", "tripulaci", "Mantenimiento", "Eliminar", "Completar"):
             self.assertNotIn(forbidden, SOURCE)
 
     def test_source_has_no_data_access_or_role_names(self):

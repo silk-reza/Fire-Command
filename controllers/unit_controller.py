@@ -45,6 +45,10 @@ class UnitBusyError(Exception):
     """La unidad está en atención y no admite la operación."""
 
 
+class UnitTransitionError(UnitValidationError):
+    """La unidad no está en un estado que admita la transición pedida."""
+
+
 class UnitNotFoundError(Exception):
     """La unidad indicada no existe."""
 
@@ -152,6 +156,8 @@ def _domain_error(error):
         return InvalidTypeError("El tipo de unidad indicado no existe.")
     if isinstance(error, unit_model.UnitBusyError):
         return UnitBusyError(str(error))
+    if isinstance(error, unit_model.UnitTransitionError):
+        return UnitTransitionError(str(error))
     if isinstance(error, unit_model.InvalidReferenceError):
         return UnitValidationError("Una referencia de la unidad no existe.")
     return UnitValidationError("Los datos de la unidad no son válidos.")
@@ -167,6 +173,7 @@ _MODEL_DOMAIN_ERRORS = (
     unit_model.InactiveTypeError,
     unit_model.InvalidUnitDataError,
     unit_model.UnitBusyError,
+    unit_model.UnitTransitionError,
 )
 
 
@@ -304,3 +311,28 @@ def list_stations_for_units():
         }
         for s in stations
     ]
+
+
+def _transition(function, unit_id):
+    _require()
+    unit_id = _validate_unit_id(unit_id)
+    current = session.get_session()
+    user_id = current["user_id"] if current else None
+    try:
+        if not function(unit_id, user_id):
+            raise UnitNotFoundError("La unidad no existe.")
+        return unit_model.get_unit(unit_id)
+    except _MODEL_DOMAIN_ERRORS as error:
+        raise _domain_error(error) from error
+    except mysql.connector.Error as error:
+        raise _technical_error() from error
+
+
+def send_unit_to_maintenance(unit_id):
+    """DISPONIBLE -> MANTENIMIENTO."""
+    return _transition(unit_model.send_unit_to_maintenance, unit_id)
+
+
+def return_unit_to_service(unit_id):
+    """MANTENIMIENTO o FUERA_DE_SERVICIO -> DISPONIBLE."""
+    return _transition(unit_model.return_unit_to_service, unit_id)

@@ -445,3 +445,25 @@ def cancel_active_dispatch(dispatch_id, reason):
         raise _domain_error(error) from error
     except mysql.connector.Error as error:
         raise _technical_error() from error
+
+
+def report_unit_failure(dispatch_id, unit_id, reason):
+    """Reporta falla de una unidad en operación: queda FUERA_DE_SERVICIO."""
+    _require_write()
+    dispatch_id = _validate_id(dispatch_id, "despacho")
+    unit_id = _validate_id(unit_id, "unidad")
+    if not isinstance(reason, str) or not reason.strip():
+        raise DispatchValidationError("El motivo de la falla es obligatorio.")
+    reason = reason.strip()
+    if len(reason) > _MAX_REASON_LENGTH:
+        raise DispatchValidationError(
+            f"El motivo de la falla no puede superar {_MAX_REASON_LENGTH} caracteres."
+        )
+    user_id = _session_user_id()
+    try:
+        dispatch_model.report_unit_failure(dispatch_id, unit_id, reason, user_id)
+        return _full_dispatch(dispatch_id)
+    except _MODEL_DOMAIN_ERRORS as error:
+        raise _domain_error(error) from error
+    except mysql.connector.Error as error:
+        raise _technical_error() from error

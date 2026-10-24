@@ -9,7 +9,7 @@ from controllers import unit_controller
 from controllers.access_controller import AuthorizationDenied
 from controllers.auth_controller import authenticate
 from controllers.unit_controller import UnitServiceError
-from tests._unit_support import UnitTestBase, db_all
+from tests._unit_support import UnitTestBase, db_all, db_exec
 from utils import session
 from views import unit_view
 from views.main_view import MainView
@@ -538,8 +538,140 @@ class UnitViewTest(UnitTestBase):
         walk(view)
         self.assertEqual(texts, {
             "Buscar", "Quitar filtros", "Guardar nuevo", "Guardar cambios", "Activar",
-            "Desactivar", "Limpiar", "Regresar",
+            "Desactivar", "Enviar a mantenimiento", "Volver a servicio", "Limpiar", "Regresar",
         })
+
+    def maintenance_buttons(self, view):
+        return (str(view.maintenance_button.cget("state")),
+                str(view.service_button.cget("state")))
+
+    def test_maintenance_buttons_enablement_matrix(self):
+        station = self.temp_station()
+        cases = {}
+        for suffix, state_code in (
+            ("DIS", "DISPONIBLE"), ("MAN", "MANTENIMIENTO"), ("FDS", "FUERA_DE_SERVICIO"),
+            ("DSP", "DESPACHADA"), ("RUT", "EN_RUTA"), ("ESC", "EN_ESCENA"),
+            ("REG", "REGRESANDO"),
+        ):
+            unit = self.make_unit(suffix)
+            if state_code != "DISPONIBLE":
+                self.set_state(unit["unit_id"], state_code)
+            cases[suffix] = unit
+        inactive = self.make_unit("INA")
+        self.set_state(inactive["unit_id"], "FUERA_DE_SERVICIO")
+        db_exec("UPDATE unidades SET activo = 0 WHERE id_unidad = %s", (inactive["unit_id"],))
+        stranded = self.make_unit("EST", station_id=station)
+        self.set_state(stranded["unit_id"], "MANTENIMIENTO")
+        db_exec("UPDATE estaciones SET activo = 0 WHERE id_estacion = %s", (station,))
+        cases["INA"] = inactive
+        cases["EST"] = stranded
+        expected = {
+            "DIS": ("normal", "disabled"), "MAN": ("disabled", "normal"),
+            "FDS": ("disabled", "normal"), "DSP": ("disabled", "disabled"),
+            "RUT": ("disabled", "disabled"), "ESC": ("disabled", "disabled"),
+            "REG": ("disabled", "disabled"), "INA": ("disabled", "disabled"),
+            "EST": ("disabled", "disabled"),
+        }
+        view = self.open_units("operador.central")
+        self.assertEqual(self.maintenance_buttons(view), ("disabled", "disabled"))
+        for suffix, buttons in expected.items():
+            self.select(view, cases[suffix]["code"])
+            self.assertEqual(self.maintenance_buttons(view), buttons, suffix)
+        view.clear_button.invoke()
+        view.update()
+        self.assertEqual(self.maintenance_buttons(view), ("disabled", "disabled"))
+
+    def test_maintenance_and_service_flow(self):
+        unit = self.make_unit("FLW")
+        uid = unit["unit_id"]
+        view = self.open_units("operador.central")
+        self.select(view, unit["code"])
+        view.confirm = lambda message: False
+        view.maintenance_button.invoke()
+        view.update()
+        self.assertEqual(self.state_of(uid), "DISPONIBLE")
+        asked = []
+        view.confirm = lambda message: asked.append(message) or True
+        view.maintenance_button.invoke()
+        view.update()
+        self.assertIn(unit["code"], asked[0])
+        self.assertEqual(self.state_of(uid), "MANTENIMIENTO")
+        self.assertEqual(view.state_label.cget("text"), "Estado operativo: Mantenimiento")
+        self.assertEqual(self.row_for(view, unit["code"])[5], "Mantenimiento")
+        self.assertEqual(self.maintenance_buttons(view), ("disabled", "normal"))
+        self.assertIn("mantenimiento", view.message_label.cget("text"))
+        view.confirm = lambda message: False
+        view.service_button.invoke()
+        self.assertEqual(self.state_of(uid), "MANTENIMIENTO")
+        view.confirm = lambda message: asked.append(message) or True
+        view.service_button.invoke()
+        view.update()
+        self.assertIn("aptitud", asked[-1])
+        self.assertIn("Disponible", asked[-1])
+        self.assertEqual(self.state_of(uid), "DISPONIBLE")
+        self.assertEqual(self.row_for(view, unit["code"])[5], "Disponible")
+        self.assertEqual(self.maintenance_buttons(view), ("normal", "disabled"))
+
+        # Desactivar, reactivar (queda Fuera de servicio) y volver a servicio
+        view.deactivate_button.invoke()
+        view.update()
+        self.assertEqual(self.state_of(uid), "FUERA_DE_SERVICIO")
+        self.assertEqual(self.maintenance_buttons(view), ("disabled", "disabled"))
+        view.activate_button.invoke()
+        view.update()
+        self.assertEqual(self.state_of(uid), "FUERA_DE_SERVICIO")
+        self.assertEqual(self.maintenance_buttons(view), ("disabled", "normal"))
+        view.service_button.invoke()
+        view.update()
+        self.assertEqual(self.state_of(uid), "DISPONIBLE")
+        self.assertEqual(self.active_of(uid), 1)
+        self.assertEqual(self.row_for(view, unit["code"])[5:], ("Disponible", "Sí"))
+
+    def test_maintenance_with_stale_state_shows_message_and_reloads(self):
+        unit = self.make_unit("STA")
+        uid = unit["unit_id"]
+        view = self.open_units("operador.central")
+        self.select(view, unit["code"])
+        self.set_state(uid, "DESPACHADA")
+        view.confirm = lambda message: True
+        view.maintenance_button.invoke()
+        view.update()
+        text = view.message_label.cget("text")
+        self.assertNotEqual(text, "")
+        self.assertNotEqual(text, unit_view.MSG_INTERNAL)
+        self.assertEqual(self.state_of(uid), "DESPACHADA")
+        self.assertEqual(view.state_label.cget("text"), "Estado operativo: Despachada")
+        self.assertEqual(self.maintenance_buttons(view), ("disabled", "disabled"))
+
+    def test_maintenance_buttons_denied_for_read_only_user(self):
+        unit = self.make_unit("RO")
+        uid = unit["unit_id"]
+        view = self.open_units("consulta.sur")
+        self.assertEqual(self.maintenance_buttons(view), ("disabled", "disabled"))
+        view.selected_id = uid
+        view.selected_active = True
+        view.selected_state_code = "DISPONIBLE"
+        view.code_entry.insert(0, unit["code"])
+        view.confirm = lambda message: True
+        view.send_to_maintenance()
+        self.assertEqual(view.message_label.cget("text"), unit_view.MSG_DENIED)
+        view.return_to_service()
+        self.assertEqual(view.message_label.cget("text"), unit_view.MSG_DENIED)
+        self.assertEqual(self.state_of(uid), "DISPONIBLE")
+
+    def test_maintenance_service_error_is_generic(self):
+        unit = self.make_unit("ERR")
+        view = self.open_units("operador.central")
+        self.select(view, unit["code"])
+        view.confirm = lambda message: True
+        error = UnitServiceError("SELECT * FROM unidades Traceback")
+        with mock.patch.object(unit_controller, "send_unit_to_maintenance", side_effect=error), \
+                self.assertLogs("views.unit_view", level="ERROR"):
+            view.maintenance_button.invoke()
+        text = view.message_label.cget("text")
+        self.assertEqual(text, unit_view.MSG_INTERNAL)
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("SELECT", text)
 
     def buttons_of(self, main):
         return [

@@ -631,6 +631,14 @@ class DispatchModelTest(DispatchTestBase):
         cancel_helper = function_body(model_source, "_cancel_active_dispatch_in_tx")
         outside = (model_source.replace(activation, "").replace(operation, "")
                    .replace(completion, "").replace(cancel_helper, ""))
+        # Falla de unidad (OBJ 15): cancela su participación y deja FUERA_DE_SERVICIO
+        failure = function_body(model_source, "report_unit_failure")
+        outside = outside.replace(failure, "")
+        self.assertEqual(failure.count("UPDATE unidades"), 1)
+        self.assertEqual(failure.count("UPDATE despacho_unidades"), 1)
+        self.assertEqual(failure.count("UPDATE despachos") + failure.count("UPDATE incidentes"), 0)
+        self.assertEqual(failure.count("DELETE") + failure.count("INSERT INTO"), 0)
+        self.assertEqual(failure.count("_complete_dispatch_if_no_active_participations("), 1)
         # Cancelación de ACTIVO (OBJ 14): único UPDATE de participaciones a cancelada y
         # transiciones de unidad; nunca completa el despacho ni toca el incidente
         self.assertEqual(cancel_helper.count("UPDATE despachos"), 1)
@@ -652,7 +660,7 @@ class DispatchModelTest(DispatchTestBase):
         self.assertEqual(completion.count("UPDATE unidades") + completion.count("UPDATE incidentes"), 0)
         self.assertEqual(completion.count("DELETE"), 0)
         self.assertEqual(
-            model_source.count("_complete_dispatch_if_no_active_participations("), 2)
+            model_source.count("_complete_dispatch_if_no_active_participations("), 3)
         call_index = operation.index("_complete_dispatch_if_no_active_participations(")
         self.assertIn('if kind == "return":', operation[max(0, call_index - 120):call_index])
         # Solo activate_dispatch y _operate_unit (OBJ 12) escriben unidades e incidentes

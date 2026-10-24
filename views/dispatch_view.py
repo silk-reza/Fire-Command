@@ -47,6 +47,7 @@ COLOR_WARNING = "#d97706"
 DRAFT_STATE = "CREADO"
 CANCELLED_STATE = "CANCELADO"
 ACTIVE_STATE = "ACTIVO"
+FAILURE_STATES = ("DESPACHADA", "EN_RUTA", "EN_ESCENA")
 COMPLETED_STATE = "COMPLETADO"
 # Solo presentación: cada estado real de la unidad habilita una única acción
 # (botón, función del controlador, texto de confirmación, mensaje de éxito,
@@ -263,11 +264,17 @@ class DispatchView(ctk.CTkToplevel):
         actions.pack(anchor="w", padx=8, pady=(0, 6))
         for attribute, _, label, _, _ in UNIT_ACTIONS.values():
             button = ctk.CTkButton(
-                actions, text=label, width=118, state="disabled",
+                actions, text=label, width=110, state="disabled",
                 command=lambda name=attribute: self.run_unit_action(name),
             )
-            button.pack(side="left", padx=(0, 4))
+            button.pack(side="left", padx=(0, 3))
             setattr(self, attribute, button)
+        # Independiente de las acciones normales: termina la participación por avería
+        self.failure_button = ctk.CTkButton(
+            actions, text="Reportar falla", width=100, state="disabled", fg_color="#b91c1c",
+            hover_color="#991b1b", command=self.report_failure,
+        )
+        self.failure_button.pack(side="left")
 
         right = ctk.CTkFrame(container)
         right.pack(side="left", fill="both")
@@ -356,7 +363,7 @@ class DispatchView(ctk.CTkToplevel):
     def ask_reason(self, prompt):
         """Pide el motivo de cancelación; devuelve None si se cierra el diálogo."""
         try:
-            dialog = ctk.CTkInputDialog(text=prompt, title="Cancelar")
+            dialog = ctk.CTkInputDialog(text=prompt, title="Motivo")
             return dialog.get_input()
         finally:
             # El diálogo toma el grab y Tk no lo devuelve; se restablece el foco modal
@@ -677,6 +684,7 @@ class DispatchView(ctk.CTkToplevel):
         unit = self._selected_unit()
         for attribute, _, _, _, _ in UNIT_ACTIONS.values():
             getattr(self, attribute).configure(state="disabled")
+        self.failure_button.configure(state="disabled")
         if unit is None:
             self.unit_times_label.configure(text="")
             return
@@ -685,6 +693,12 @@ class DispatchView(ctk.CTkToplevel):
                  f"Llegada: {_format_date(unit.get('arrived_at'))}  "
                  f"Liberación: {_format_date(unit.get('released_at'))}"
         )
+        if (
+            self.can_write and self.selected_state_code == ACTIVE_STATE
+            and unit["state_code"] in FAILURE_STATES
+            and unit.get("assigned_at") is not None and unit.get("released_at") is None
+        ):
+            self.failure_button.configure(state="normal")
         action = UNIT_ACTIONS.get(unit["state_code"])
         # En un despacho cancelado solo se libera una participación que sí fue asignada
         cancelled_draft = (
@@ -865,3 +879,34 @@ class DispatchView(ctk.CTkToplevel):
             self.refresh_list()
             self.refresh_available()
             self.show_message(f"Despacho N.º {number} cancelado correctamente.")
+
+    def report_failure(self):
+        """Reporta una falla de la unidad seleccionada con motivo obligatorio."""
+        unit = self._selected_unit()
+        if self.selected_id is None or unit is None:
+            self.show_message(MSG_SELECT_DRAFT_UNIT, error=True)
+            return
+        code = unit["unit_code"]
+        reason = self.ask_reason(f"Motivo de la falla de la unidad {code}.")
+        if reason is None or reason == "":
+            self.show_message("No se reportó la falla: el motivo es obligatorio.", error=True)
+            return
+        message = (
+            f"¿Reportar la falla de la unidad {code}? La unidad pasará a Fuera de servicio, "
+            "su participación en el despacho terminará y, si era la última, el despacho "
+            "se completará. Esta acción no se puede deshacer desde esta pantalla."
+        )
+        if not self.confirm(message):
+            return
+        ok, dispatch = self._run(
+            dispatch_controller.report_unit_failure, self.selected_id, unit["unit_id"],
+            reason, write=True,
+        )
+        if ok:
+            self._show_dispatch(dispatch, keep_text=True)
+            self.refresh_list()
+            self.refresh_available()
+            text = f"Falla de la unidad {code} registrada. Quedó Fuera de servicio."
+            if dispatch["state_code"] == COMPLETED_STATE:
+                text += " El despacho quedó finalizado."
+            self.show_message(text)

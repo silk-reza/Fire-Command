@@ -3,8 +3,9 @@ from tkinter import messagebox, ttk
 
 import customtkinter as ctk
 
-from controllers import unit_controller
+from controllers import access_controller, unit_controller
 from controllers.access_controller import AuthorizationDenied, NotAuthenticated
+from utils.permissions import PERMISSION_MANAGE_RESOURCES
 from controllers.unit_controller import (
     DuplicateUnitCodeError,
     DuplicateUnitPlateError,
@@ -63,7 +64,10 @@ class UnitView(ctk.CTkToplevel):
         self.resizable(False, False)
         self.selected_id = None
         self.selected_active = None
+        self.selected_state_code = None
         self._refreshing = False
+        # La escritura la decide el permiso; el controlador vuelve a validarlo
+        self.can_write = access_controller.can(PERMISSION_MANAGE_RESOURCES)
         # Solo presentación: texto del selector -> id
         self._station_ids = {}
         self._station_texts = {}
@@ -203,6 +207,12 @@ class UnitView(ctk.CTkToplevel):
             bar, text="Desactivar", width=90, fg_color="#b45309", hover_color="#92400e",
             command=self.deactivate,
         )
+        self.maintenance_button = ctk.CTkButton(
+            bar, text="Enviar a mantenimiento", width=160, command=self.send_to_maintenance,
+        )
+        self.service_button = ctk.CTkButton(
+            bar, text="Volver a servicio", width=130, command=self.return_to_service,
+        )
         self.clear_button = ctk.CTkButton(
             bar, text="Limpiar", width=90, fg_color="gray40", hover_color="gray30",
             command=self.clear_form,
@@ -213,7 +223,8 @@ class UnitView(ctk.CTkToplevel):
         )
         for button in (
             self.create_button, self.save_button, self.activate_button,
-            self.deactivate_button, self.clear_button, self.back_button,
+            self.deactivate_button, self.maintenance_button, self.service_button,
+            self.clear_button, self.back_button,
         ):
             button.pack(side="left", padx=4)
 
@@ -373,6 +384,7 @@ class UnitView(ctk.CTkToplevel):
         self._fill_form(unit)
         self.selected_id = unit["unit_id"]
         self.selected_active = unit["active"]
+        self.selected_state_code = unit["state_code"]
         self.form_title.configure(text=f"Editando: {unit['code']}")
         self.state_label.configure(text=f"Estado operativo: {unit['state_name']}")
         self._update_buttons()
@@ -401,6 +413,7 @@ class UnitView(ctk.CTkToplevel):
         self._apply_form_options(None, None)
         self.selected_id = None
         self.selected_active = None
+        self.selected_state_code = None
         self._refreshing = True
         try:
             self.tree.selection_remove(*self.tree.selection())
@@ -423,6 +436,18 @@ class UnitView(ctk.CTkToplevel):
         )
         self.deactivate_button.configure(
             state="normal" if selected and self.selected_active else "disabled"
+        )
+        # Presentación: el controlador valida de nuevo estado, actividad y estación
+        station_active = any(
+            s["active"] for s in self._stations if s["station_id"] == self.selected_station_id
+        )
+        usable = self.can_write and selected and bool(self.selected_active)
+        self.maintenance_button.configure(
+            state="normal" if usable and self.selected_state_code == "DISPONIBLE" else "disabled"
+        )
+        self.service_button.configure(
+            state="normal" if usable and station_active and self.selected_state_code in (
+                "MANTENIMIENTO", "FUERA_DE_SERVICIO") else "disabled"
         )
 
     def _form_data(self):
@@ -482,3 +507,44 @@ class UnitView(ctk.CTkToplevel):
                 success_text or f"Unidad {unit['code']} desactivada correctamente. "
                 "Quedó Fuera de servicio."
             )
+
+    def send_to_maintenance(self):
+        if self.selected_id is None:
+            return
+        code = self.code_entry.get()
+        if not self.confirm(f"¿Enviar la unidad {code} a mantenimiento?"):
+            return
+        self._operate(
+            unit_controller.send_unit_to_maintenance,
+            "Unidad {code} enviada a mantenimiento.",
+        )
+
+    def return_to_service(self):
+        if self.selected_id is None:
+            return
+        code = self.code_entry.get()
+        message = (
+            f"Esta es la confirmación explícita de que la unidad {code} es apta para el "
+            "servicio (aptitud). ¿Volver a servicio? La unidad pasará a Disponible."
+        )
+        if not self.confirm(message):
+            return
+        self._operate(
+            unit_controller.return_unit_to_service,
+            "Unidad {code} de vuelta en servicio. Quedó Disponible.",
+        )
+
+    def _operate(self, function, success_text):
+        ok, unit = self._run(function, self.selected_id)
+        if ok:
+            self._load_unit(unit)
+            self.refresh_list()
+            self.show_message(success_text.format(code=unit["code"]))
+            return
+        # Tras un rechazo se relee la unidad por si su estado cambió
+        if self.selected_id is not None:
+            try:
+                self._load_unit(unit_controller.get_unit(self.selected_id))
+            except Exception:
+                pass
+            self.refresh_list()
