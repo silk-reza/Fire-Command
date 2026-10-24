@@ -65,7 +65,7 @@ class LoginView(ctk.CTk):
         return self.message_label.cget("text")
 
     def attempt_login(self):
-        """Valida los campos, autentica vía controller y arranca la sesión."""
+        """Valida los campos, autentica y registra el acceso vía controller y arranca la sesión."""
         username = self.username_entry.get().strip()
         password = self.password_entry.get()
         if not username or not password:
@@ -73,7 +73,7 @@ class LoginView(ctk.CTk):
             return
 
         try:
-            user = auth_controller.authenticate(username, password)
+            user = auth_controller.login(username, password)
         except AccessDenied:
             self._fail(MSG_DENIED)
             return

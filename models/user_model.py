@@ -309,3 +309,18 @@ def set_user_active(user_id, active):
         return True
 
     return _write(operation)
+
+
+def record_login(user_id):
+    """Registra un inicio de sesión exitoso en bitácora (transacción corta propia)."""
+
+    def operation(cursor):
+        cursor.execute(
+            """
+            INSERT INTO bitacora (id_usuario, accion, entidad, id_entidad, detalle)
+            VALUES (%s, 'LOGIN', 'USUARIO', %s, 'Inicio de sesión exitoso.')
+            """,
+            (user_id, user_id),
+        )
+
+    _write(operation)

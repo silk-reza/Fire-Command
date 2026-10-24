@@ -318,7 +318,7 @@ class UnitControllerTest(UnitTestBase):
         react = uc.activate_unit(uid)
         self.assertTrue(react["active"])
         self.assertEqual(react["state_code"], "FUERA_DE_SERVICIO")
-        self.assertEqual(len(self.audit_rows(uid)), 1)
+        self.assertEqual([a[1] for a in self.audit_rows(uid)], ["DESACTIVAR", "REACTIVAR"])
         # reactivar una unidad activa no cambia nada
         other = self._create("B")["unit_id"]
         before = self.row(other)
@@ -439,7 +439,7 @@ class UnitControllerTest(UnitTestBase):
                     moved = uc.update_unit(uid, self._data(sfx, station_id=target))
                     self.assertEqual(moved["station_id"], target)
                     self.assertFalse(uc.deactivate_unit(uid)["active"])
-                    self.assertEqual(len(self.audit_rows(uid)), 1)
+                    self.assertEqual([a[1] for a in self.audit_rows(uid)], ["MODIFICAR", "DESACTIVAR"])
 
 
 if __name__ == "__main__":

@@ -37,7 +37,7 @@ class LoginGuiTest(unittest.TestCase):
     def test_empty_fields(self):
         for username, password in (("", ""), ("admin.demo", ""), ("  ", PASSWORD)):
             view = self.make_login(username, password)
-            with mock.patch.object(auth_controller, "authenticate") as auth:
+            with mock.patch.object(auth_controller, "login") as auth:
                 view.attempt_login()
             auth.assert_not_called()
             self.assertEqual(view.message, login_view.MSG_EMPTY)
@@ -61,7 +61,10 @@ class LoginGuiTest(unittest.TestCase):
 
     def test_login_ok_opens_main_and_logout_returns_to_login(self):
         view = self.make_login("admin.demo", PASSWORD)
-        view.attempt_login()
+        # Se evita escribir el LOGIN en la bitácora real durante la prueba
+        with mock.patch.object(auth_controller.user_model, "record_login") as record:
+            view.attempt_login()
+        record.assert_called_once()
         self.assertIsNotNone(view.result)
         current = session.get_session()
         self.assertEqual(current["username"], "admin.demo")
@@ -82,7 +85,7 @@ class LoginGuiTest(unittest.TestCase):
     def test_technical_error_message(self):
         view = self.make_login("admin.demo", PASSWORD)
         with mock.patch.object(
-            auth_controller, "authenticate", side_effect=AuthServiceError("db caída: secreto")
+            auth_controller, "login", side_effect=AuthServiceError("db caída: secreto")
         ), self.assertLogs(login_view.logger, level="ERROR"):
             view.attempt_login()
         self.assertEqual(view.message, login_view.MSG_INTERNAL)

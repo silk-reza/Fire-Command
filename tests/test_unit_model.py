@@ -19,6 +19,10 @@ class UnitModelTest(UnitTestBase):
         ("CANCELADO", "ASSIGNED", False),
         ("CREADO", "PRESELECTION", False),
     ]
+    def update_unit(self, unit_id, fields, user_id=None):
+        """Llama al modelo con el usuario administrador (la bitácora exige usuario)."""
+        return um.update_unit(unit_id, fields, user_id or self.user_id("admin.demo"))
+
     def _create(self, suffix="A", **overrides):
         values = {
             "code": f"{self.prefix}-{suffix}", "name": "Unidad temporal",
@@ -70,20 +74,54 @@ class UnitModelTest(UnitTestBase):
         self.assertNotIn(plain, self._ids(um.search_units("a%")))
 
     def test_filters(self):
-        by_station = um.list_units(station_id=1)
-        self.assertEqual({u["unit_id"] for u in by_station if u["unit_id"] <= 11}, {1, 2, 3, 10})
-        self.assertTrue(all(u["station_id"] == 1 for u in by_station))
-        combo = um.search_units("", station_id=1, type_id=1)
-        self.assertEqual({u["unit_id"] for u in combo}, {1, 10})
-        state_id = db_all("SELECT id_estado_unidad FROM estados_unidad WHERE codigo='DISPONIBLE'")[0][0]
-        disp = um.list_units(state_id=state_id)
-        self.assertTrue({1, 7, 8} <= {u["unit_id"] for u in disp})
+        # Datos propios: no dependen del estado de las unidades de la demo
+        station, other_station = self.temp_station(), self.temp_station()
+        unit_type = self.temp_type()
+        available = self._create("FA", station_id=station, type_id=unit_type)
+        maintenance = self._create("FM", station_id=station, type_id=unit_type)
+        elsewhere = self._create("FE")  # estación y tipo del seed
+        self.set_state(maintenance, "MANTENIMIENTO")
+        ids = lambda units: {u["unit_id"] for u in units}  # noqa: E731
+
+        by_station = um.list_units(station_id=station)
+        self.assertEqual(ids(by_station), {available, maintenance})
+        self.assertTrue(all(u["station_id"] == station for u in by_station))
+        self.assertEqual(ids(um.list_units(station_id=other_station)), set())
+        self.assertNotIn(elsewhere, ids(by_station))
+
+        # filtro por tipo y combinación estación + tipo
+        self.assertEqual(ids(um.list_units(type_id=unit_type)), {available, maintenance})
+        self.assertEqual(ids(um.search_units("", station_id=station, type_id=unit_type)),
+                         {available, maintenance})
+        self.assertEqual(um.search_units("", station_id=other_station, type_id=unit_type), [])
+        self.assertEqual(um.search_units("", station_id=station, type_id=self.seed_type), [])
+
+        # filtro por estado: incluye lo esperado y excluye lo demás
+        available_id = db_all(
+            "SELECT id_estado_unidad FROM estados_unidad WHERE codigo='DISPONIBLE'")[0][0]
+        maintenance_id = db_all(
+            "SELECT id_estado_unidad FROM estados_unidad WHERE codigo='MANTENIMIENTO'")[0][0]
+        disp = um.list_units(state_id=available_id)
+        self.assertTrue({available, elsewhere} <= ids(disp))
+        self.assertNotIn(maintenance, ids(disp))
         self.assertTrue(all(u["state_code"] == "DISPONIBLE" for u in disp))
-        self.assertEqual(um.search_units("", station_id=2, type_id=1), [])
-        # el grupo OR no escapa de los filtros AND
-        self.assertEqual(um.search_units("B-", station_id=2), [])
-        # "B-0" coincide con el código B-02 y la placa AMB-002 de la estación 3
-        self.assertEqual(self._ids(um.search_units("B-0", station_id=3)), [8, 7])
+        maint = um.list_units(state_id=maintenance_id)
+        self.assertIn(maintenance, ids(maint))
+        self.assertTrue({available, elsewhere}.isdisjoint(ids(maint)))
+        self.assertEqual(ids(um.search_units("", station_id=station, state_id=available_id)),
+                         {available})
+        self.assertEqual(ids(um.search_units("", station_id=station, type_id=unit_type,
+                                             state_id=maintenance_id)), {maintenance})
+
+        # el grupo OR del texto no escapa de los filtros AND
+        self.assertEqual(ids(um.search_units(self.prefix, station_id=station)),
+                         {available, maintenance})
+        self.assertEqual(um.search_units(self.prefix, station_id=other_station), [])
+        self.assertEqual(um.search_units(f"{self.prefix}-FA", station_id=station,
+                                         state_id=maintenance_id), [])
+        # la búsqueda sigue encontrando por placa y nombre dentro de la estación
+        self.assertEqual(ids(um.search_units(f"{self.plate_prefix}-FM", station_id=station)),
+                         {maintenance})
 
     def test_types_and_states(self):
         types = um.list_unit_types()
@@ -183,18 +221,18 @@ class UnitModelTest(UnitTestBase):
         uid = self._create(station_id=active)
         before = self.row(uid)
         with self.assertRaises(um.InactiveStationError):
-            um.update_unit(uid, self._fields(station_id=inactive))
+            self.update_unit(uid, self._fields(station_id=inactive))
         self.assertEqual(self.row(uid), before)
         # estación activa que se desactiva después: editar otros campos sí
         from models import station_model
         station_model.set_station_active(active, False)
-        self.assertTrue(um.update_unit(uid, self._fields(name="Nuevo", station_id=active)))
+        self.assertTrue(self.update_unit(uid, self._fields(name="Nuevo", station_id=active)))
         self.assertEqual(um.get_unit(uid)["name"], "Nuevo")
         another = self.temp_station(active=False)
         with self.assertRaises(um.InactiveStationError):
-            um.update_unit(uid, self._fields(station_id=another))
+            self.update_unit(uid, self._fields(station_id=another))
         # inactiva -> activa permitido
-        self.assertTrue(um.update_unit(uid, self._fields(station_id=self.seed_station)))
+        self.assertTrue(self.update_unit(uid, self._fields(station_id=self.seed_station)))
         self.assertEqual(um.get_unit(uid)["station_id"], self.seed_station)
 
     def test_inactive_type_rules(self):
@@ -204,19 +242,19 @@ class UnitModelTest(UnitTestBase):
         uid = self._create()
         before = self.row(uid)
         with self.assertRaises(um.InactiveTypeError):
-            um.update_unit(uid, self._fields(type_id=inactive))
+            self.update_unit(uid, self._fields(type_id=inactive))
         self.assertEqual(self.row(uid), before)
         # tipo histórico que se desactiva: se conserva al editar otros campos
         legacy = self.temp_type()
         uid2 = self._create("B", type_id=legacy)
         self.deactivate_temp_type(legacy)
-        self.assertTrue(um.update_unit(uid2, self._fields("B", name="Otro", type_id=legacy)))
+        self.assertTrue(self.update_unit(uid2, self._fields("B", name="Otro", type_id=legacy)))
         found = um.get_unit(uid2)
         self.assertEqual(found["type_id"], legacy)
         self.assertIn(uid2, self._ids(um.list_units()))
         self.assertFalse(next(t for t in um.list_unit_types() if t["type_id"] == legacy)["active"])
         with self.assertRaises(um.InactiveTypeError):
-            um.update_unit(uid2, self._fields("B", type_id=inactive))
+            self.update_unit(uid2, self._fields("B", type_id=inactive))
 
     def test_update_persists_and_keeps_state(self):
         other_station = self.temp_station()
@@ -227,7 +265,7 @@ class UnitModelTest(UnitTestBase):
         fields = self._fields(code=f"{self.prefix}-N", name="Nombre2", plate=f"{self.plate_prefix}-N",
                               capacity=9, description="D2", station_id=other_station,
                               type_id=other_type)
-        self.assertTrue(um.update_unit(uid, fields))
+        self.assertTrue(self.update_unit(uid, fields))
         unit = um.get_unit(uid)
         self.assertEqual((unit["code"], unit["name"], unit["plate"], unit["capacity"],
                           unit["description"], unit["station_id"], unit["type_id"]),
@@ -236,17 +274,17 @@ class UnitModelTest(UnitTestBase):
         self.assertEqual(db_all("SELECT id_estado_unidad FROM unidades WHERE id_unidad=%s", (uid,)),
                          state_before)
         # sin cambios no se confunde con inexistente
-        self.assertTrue(um.update_unit(uid, fields))
-        self.assertFalse(um.update_unit(4000000000, fields))
+        self.assertTrue(self.update_unit(uid, fields))
+        self.assertFalse(self.update_unit(4000000000, fields))
 
     def test_update_duplicates(self):
         first = self._create("A")
         second = self._create("B")
         before = (self.row(first), self.row(second))
         with self.assertRaises(um.DuplicateUnitCodeError):
-            um.update_unit(second, self._fields("B", code=f"{self.prefix}-A"))
+            self.update_unit(second, self._fields("B", code=f"{self.prefix}-A"))
         with self.assertRaises(um.DuplicateUnitPlateError):
-            um.update_unit(second, self._fields("B", plate=f"{self.plate_prefix}-A"))
+            self.update_unit(second, self._fields("B", plate=f"{self.plate_prefix}-A"))
         self.assertEqual((self.row(first), self.row(second)), before)
 
     def test_transfer_rule(self):
@@ -256,16 +294,16 @@ class UnitModelTest(UnitTestBase):
             self.set_state(uid, code)
             before = self.row(uid)
             with self.assertRaises(um.UnitBusyError, msg=code):
-                um.update_unit(uid, self._fields(code[:3] + code[-2:], station_id=target))
+                self.update_unit(uid, self._fields(code[:3] + code[-2:], station_id=target))
             self.assertEqual(self.row(uid), before)
             # editar otros campos sin cambiar de estación sí se permite
-            self.assertTrue(um.update_unit(
+            self.assertTrue(self.update_unit(
                 uid, self._fields(code[:3] + code[-2:], name="Editada")))
         for code in ("DISPONIBLE", "MANTENIMIENTO", "REGRESANDO", "FUERA_DE_SERVICIO"):
             suffix = "T" + code[:3] + code[-2:]
             uid = self._create(suffix)
             self.set_state(uid, code)
-            self.assertTrue(um.update_unit(uid, self._fields(suffix, station_id=target)), code)
+            self.assertTrue(self.update_unit(uid, self._fields(suffix, station_id=target)), code)
             self.assertEqual(um.get_unit(uid)["station_id"], target)
             self.assertEqual(self.state_of(uid), code)
 
@@ -355,8 +393,10 @@ class UnitModelTest(UnitTestBase):
         unit = um.get_unit(uid)
         self.assertTrue(unit["active"])
         self.assertEqual(unit["state_code"], "FUERA_DE_SERVICIO")
-        # sin fila de bitácora adicional por reactivación
-        self.assertEqual(len(self.audit_rows(uid)), 1)
+        # La reactivación administrativa deja su propia fila (REACTIVAR) tras DESACTIVAR
+        audit = self.audit_rows(uid)
+        self.assertEqual([a[1] for a in audit], ["DESACTIVAR", "REACTIVAR"])
+        self.assertIn("FUERA_DE_SERVICIO hasta un retorno a servicio explícito", audit[1][4])
         # reactivar una unidad activa no cambia nada
         other = self._create("B")
         before = self.row(other)
@@ -391,24 +431,25 @@ class UnitModelTest(UnitTestBase):
             self.add_participation(uid, dstate, kind)
             before = self.row(uid)
             # edición sin cambio de estación nunca se bloquea por participaciones
-            self.assertTrue(um.update_unit(uid, self._fields(sfx, name="Editada")))
+            self.assertTrue(self.update_unit(uid, self._fields(sfx, name="Editada")))
             before = self.row(uid)
             if blocks:
                 with self.assertRaises(um.UnitBusyError, msg=(dstate, kind)) as ctx:
-                    um.update_unit(uid, self._fields(sfx, station_id=target))
+                    self.update_unit(uid, self._fields(sfx, station_id=target))
                 self.assertIn("participación activa", str(ctx.exception))
                 self.assertEqual(self.row(uid), before)
             else:
-                self.assertTrue(um.update_unit(uid, self._fields(sfx, station_id=target)))
+                self.assertTrue(self.update_unit(uid, self._fields(sfx, station_id=target)))
                 self.assertEqual(um.get_unit(uid)["station_id"], target)
             self.assertEqual(self.state_of(uid), "DISPONIBLE")
 
     def test_no_participation_behaviour_preserved(self):
         user_id = self.user_id("admin.demo")
         uid = self._create()
-        self.assertTrue(um.update_unit(uid, self._fields(station_id=self.temp_station())))
+        self.assertTrue(self.update_unit(uid, self._fields(station_id=self.temp_station())))
         self.assertTrue(um.set_unit_active(uid, False, user_id))
-        self.assertEqual(len(self.audit_rows(uid)), 1)
+        # El traslado (MODIFICAR) y el retiro (DESACTIVAR) dejan una fila cada uno
+        self.assertEqual([a[1] for a in self.audit_rows(uid)], ["MODIFICAR", "DESACTIVAR"])
 
     def test_inactive_unit_noop_even_with_participation(self):
         user_id = self.user_id("admin.demo")
@@ -419,7 +460,7 @@ class UnitModelTest(UnitTestBase):
         self.assertTrue(um.set_unit_active(uid, False, user_id))
         self.assertTrue(um.set_unit_active(uid, True, user_id))
         self.assertEqual(self.active_of(uid), 1)
-        self.assertEqual(len(self.audit_rows(uid)), 1)
+        self.assertEqual([a[1] for a in self.audit_rows(uid)], ["DESACTIVAR", "REACTIVAR"])
         self.assertNotEqual(self.row(uid), before)
 
     def test_participation_check_blocks_while_unit_locked(self):
@@ -511,16 +552,16 @@ class UnitModelTest(UnitTestBase):
         with self.assertRaises(um.UnitBusyError):
             um.set_unit_active(blocked, False, user_id)
         with self.assertRaises(um.UnitBusyError):
-            um.update_unit(blocked, self._fields("M1", station_id=target))
+            self.update_unit(blocked, self._fields("M1", station_id=target))
         self.assertEqual(self.row(blocked), before)
         self.assertEqual(self.audit_rows(blocked), [])
         # una liberada y otra cancelada: no bloquea
         free = self._create("M2")
         self.add_participation(free, "ACTIVO", "RELEASED")
         self.add_participation(free, "ACTIVO", "CANCELLED")
-        self.assertTrue(um.update_unit(free, self._fields("M2", station_id=target)))
+        self.assertTrue(self.update_unit(free, self._fields("M2", station_id=target)))
         self.assertTrue(um.set_unit_active(free, False, user_id))
-        self.assertEqual(len(self.audit_rows(free)), 1)
+        self.assertEqual([a[1] for a in self.audit_rows(free)], ["MODIFICAR", "DESACTIVAR"])
 
 
 if __name__ == "__main__":

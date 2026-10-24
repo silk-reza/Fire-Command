@@ -1,7 +1,11 @@
+import logging
+
 import bcrypt
 import mysql.connector
 
 from models import user_model
+
+logger = logging.getLogger(__name__)
 
 
 class AccessDenied(Exception):
@@ -45,3 +49,17 @@ def authenticate(username, password):
         "role_code": user["role_code"],
         "active": bool(user["active"]),
     }
+
+
+def login(username, password):
+    """Autentica y registra el LOGIN en bitácora; devuelve el dict del usuario.
+
+    El inicio de sesión no es una operación de negocio transaccional: si la bitácora
+    falla se registra el error técnico y el acceso continúa (decisión documentada).
+    """
+    user = authenticate(username, password)
+    try:
+        user_model.record_login(user["user_id"])
+    except mysql.connector.Error:
+        logger.exception("No se pudo registrar el inicio de sesión en la bitácora")
+    return user

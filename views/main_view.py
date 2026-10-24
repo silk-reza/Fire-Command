@@ -3,6 +3,7 @@ import customtkinter as ctk
 from controllers import access_controller
 from utils import permissions as perm
 from utils import session
+from views.audit_view import AuditView
 from views.dashboard_view import DashboardView
 from views.dispatch_view import DispatchView
 from views.incident_query_view import IncidentQueryView
@@ -50,6 +51,8 @@ class MainView(ctk.CTk):
         self.dispatches_button = None
         self.dashboard_view = None
         self.dashboard_button = None
+        self.audit_view = None
+        self.audit_button = None
         self.report_view = None
         self.reports_button = None
 
@@ -114,6 +117,13 @@ class MainView(ctk.CTk):
             elif permission == perm.PERMISSION_OPERATE_DISPATCHES:
                 # Borradores de despacho: reemplaza la etiqueta pendiente
                 widget = self._ensure_dispatches_button(frame)
+            elif permission == perm.PERMISSION_VIEW_AUDIT:
+                # Bitácora de solo lectura: el controlador valida el permiso en cada consulta
+                self.audit_button = ctk.CTkButton(
+                    frame, text="Bitácora", command=self.open_audit
+                )
+                self.audit_button.pack(padx=30, pady=4, anchor="w")
+                widget = self.audit_button
             else:
                 if permission == perm.PERMISSION_VIEW_REPORTS:
                     # El dashboard es el primer informe real; Reportes sigue pendiente
@@ -217,6 +227,14 @@ class MainView(ctk.CTk):
             return self.dashboard_view
         self.dashboard_view = DashboardView(self)
         return self.dashboard_view
+
+    def open_audit(self):
+        """Abre la bitácora; si ya está abierta, la trae al frente."""
+        if self.audit_view is not None and self.audit_view.winfo_exists():
+            self.audit_view.lift()
+            return self.audit_view
+        self.audit_view = AuditView(self)
+        return self.audit_view
 
     def open_reports(self):
         """Abre los reportes; si ya están abiertos, los trae al frente."""

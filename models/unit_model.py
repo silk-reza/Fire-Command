@@ -288,6 +288,7 @@ def _lock_unit(cursor, unit_id):
     cursor.execute(
         """
         SELECT u.id_unidad, u.id_estacion, u.id_tipo_unidad, u.activo,
+               u.codigo, u.nombre, u.placa, u.capacidad_personal, u.descripcion,
                s.codigo AS state_code
         FROM unidades u
         INNER JOIN estados_unidad s ON s.id_estado_unidad = u.id_estado_unidad
@@ -299,8 +300,25 @@ def _lock_unit(cursor, unit_id):
     return cursor.fetchone()
 
 
-def update_unit(unit_id, fields):
-    """Actualiza datos administrativos (nunca el estado); False si no existe."""
+# Campo del formulario -> (columna física en unidades, columna de la fila bloqueada)
+_AUDITED_FIELDS = (
+    ("code", "codigo", "codigo"),
+    ("name", "nombre", "nombre"),
+    ("plate", "placa", "placa"),
+    ("capacity", "capacidad_personal", "capacidad_personal"),
+    ("description", "descripcion", "descripcion"),
+    ("station_id", "id_estacion", "id_estacion"),
+    ("type_id", "id_tipo_unidad", "id_tipo_unidad"),
+)
+
+
+def update_unit(unit_id, fields, user_id):
+    """Actualiza datos administrativos (nunca el estado); False si no existe.
+
+    Deja una sola entrada de bitácora con los campos que realmente cambiaron.
+    """
+    if isinstance(user_id, bool) or not isinstance(user_id, int):
+        raise InvalidUnitDataError("El identificador de usuario no es válido.")
 
     def operation(cursor):
         # rowcount es 0 cuando no hay cambios, por eso se verifica existencia aparte
@@ -340,9 +358,37 @@ def update_unit(unit_id, fields):
                 unit_id,
             ),
         )
+        changed = []
+        for key, column, current_column in _AUDITED_FIELDS:
+            new_value = fields[key]
+            if key in ("name", "plate", "description"):
+                new_value = new_value or None
+            if new_value != current[current_column]:
+                changed.append(column)
+        if changed:
+            detail = f"Campos modificados: {', '.join(changed)}."
+            if fields["station_id"] != current["id_estacion"]:
+                cursor.execute(
+                    "SELECT id_estacion, codigo FROM estaciones WHERE id_estacion IN (%s, %s)",
+                    (current["id_estacion"], fields["station_id"]),
+                )
+                codes = {r["id_estacion"]: r["codigo"] for r in cursor.fetchall()}
+                detail += (f" Traslado de estación: {codes.get(current['id_estacion'])} → "
+                           f"{codes.get(fields['station_id'])}.")
+            _audit_modification(cursor, user_id, unit_id, detail)
         return True
 
     return _write(operation)
+
+
+def _audit_modification(cursor, user_id, unit_id, detail):
+    cursor.execute(
+        """
+        INSERT INTO bitacora (id_usuario, accion, entidad, id_entidad, detalle)
+        VALUES (%s, 'MODIFICAR', 'UNIDAD', %s, %s)
+        """,
+        (user_id, unit_id, detail),
+    )
 
 
 def set_unit_active(unit_id, active, user_id):
@@ -389,6 +435,19 @@ def set_unit_active(unit_id, active, user_id):
             cursor.execute(
                 "UPDATE unidades SET activo = 1, id_estado_unidad = %s WHERE id_unidad = %s",
                 (fds_id, unit_id),
+            )
+            # La bitácora confirma o revierte junto con la reactivación
+            cursor.execute(
+                """
+                INSERT INTO bitacora (id_usuario, accion, entidad, id_entidad, detalle)
+                VALUES (%s, 'REACTIVAR', 'UNIDAD', %s, %s)
+                """,
+                (
+                    user_id,
+                    unit_id,
+                    "Reactivación administrativa (activo: 0 → 1). La unidad permanece en "
+                    f"{OUT_OF_SERVICE_STATE_CODE} hasta un retorno a servicio explícito.",
+                ),
             )
         return True
 

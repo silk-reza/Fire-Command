@@ -414,7 +414,9 @@ class MainViewReportTest(unittest.TestCase):
                 ]
                 self.assertFalse([t for t in labels if t.startswith("Reportes")])
                 if username == "admin.demo":
-                    self.assertTrue([t for t in labels if t.startswith("Bitácora")])
+                    # Bitácora ya es un botón real para quien tiene el permiso
+                    self.assertFalse([t for t in labels if t.startswith("Bitácora")])
+                    self.assertEqual(main.audit_button.cget("text"), "Bitácora")
                 main.destroy()
                 session.end_session()
 

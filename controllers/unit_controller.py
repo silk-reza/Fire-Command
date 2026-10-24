@@ -241,9 +241,11 @@ def update_unit(unit_id, data):
     _require()
     unit_id = _validate_unit_id(unit_id)
     fields = _validate_fields(data)
+    current = session.get_session()
+    user_id = current["user_id"] if current else None
     try:
         _check_references_exist(fields)
-        if not unit_model.update_unit(unit_id, fields):
+        if not unit_model.update_unit(unit_id, fields, user_id):
             raise UnitNotFoundError("La unidad no existe.")
         return unit_model.get_unit(unit_id)
     except _MODEL_DOMAIN_ERRORS as error:

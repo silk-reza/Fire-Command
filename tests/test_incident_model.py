@@ -171,9 +171,12 @@ class IncidentModelTest(IncidentTestBase):
         audit = self.audit_rows(iid)
         self.assertEqual(len(audit), 2)
         self.assertEqual(audit[1][:4], (self._user(), "MODIFICAR", "INCIDENTE", iid))
+        names = {p["priority_id"]: p["name"] for p in im.list_priorities()}
+        # El cambio de prioridad queda legible en la misma entrada (OBJ 21)
         self.assertEqual(audit[1][4], "Campos modificados: id_tipo_incidente, id_prioridad, "
                          "direccion, referencia, latitud, longitud, descripcion, "
-                         "personas_afectadas.")
+                         f"personas_afectadas. Prioridad: {names[self.seed_priority]} → "
+                         f"{names[new_priority]}.")
 
     def test_update_lists_only_changed_fields(self):
         iid = self._create()

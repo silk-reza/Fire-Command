@@ -367,7 +367,17 @@ def update_incident(incident_id, fields, user_id):
             tuple(params),
         )
         names = ", ".join(_EDITABLE_COLUMNS[key] for key in changed)
-        _audit(cursor, user_id, "MODIFICAR", incident_id, f"Campos modificados: {names}.")
+        detail = f"Campos modificados: {names}."
+        if "priority_id" in changed:
+            # El cambio de prioridad queda legible en la misma entrada (sin duplicarla)
+            cursor.execute(
+                "SELECT id_prioridad, nombre FROM prioridades WHERE id_prioridad IN (%s, %s)",
+                (current["id_prioridad"], new_values["priority_id"]),
+            )
+            priority_names = {r["id_prioridad"]: r["nombre"] for r in cursor.fetchall()}
+            detail += (f" Prioridad: {priority_names.get(current['id_prioridad'])} → "
+                       f"{priority_names.get(new_values['priority_id'])}.")
+        _audit(cursor, user_id, "MODIFICAR", incident_id, detail)
         return True
 
     return _write(operation)
