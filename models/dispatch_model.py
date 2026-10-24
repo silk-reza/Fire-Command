@@ -1,3 +1,4 @@
+import math
 import re
 
 import mysql.connector
@@ -1501,6 +1502,22 @@ def remove_crew_member(dispatch_id, unit_id, personnel_id, user_id):
     return _write(operation, isolation="READ COMMITTED")
 
 
+# Elegibilidad compartida por el recomendador por tipo y por unidad: compatibilidad activa,
+# tipo activo, unidad activa, estado DISPONIBLE (parámetro) y estación activa
+_RECOMMENDATION_FROM = """
+        FROM incidentes i
+        LEFT JOIN (compatibilidad_incidente_unidad c
+                   INNER JOIN tipos_unidad t ON t.id_tipo_unidad = c.id_tipo_unidad
+                                            AND t.activo = 1)
+               ON c.id_tipo_incidente = i.id_tipo_incidente AND c.activo = 1
+        LEFT JOIN (unidades u
+                   INNER JOIN estados_unidad s ON s.id_estado_unidad = u.id_estado_unidad
+                                              AND s.codigo = %s
+                   INNER JOIN estaciones e ON e.id_estacion = u.id_estacion AND e.activo = 1)
+               ON u.id_tipo_unidad = t.id_tipo_unidad AND u.activo = 1
+"""
+
+
 def get_unit_recommendations_for_incident(incident_id):
     """Tipos de unidad recomendados para el incidente con sus unidades disponibles.
 
@@ -1514,16 +1531,7 @@ def get_unit_recommendations_for_incident(incident_id):
                c.prioridad_recomendacion AS priority, c.observacion AS note,
                u.id_unidad AS unit_id, u.codigo AS unit_code,
                e.id_estacion AS station_id, e.codigo AS station_code
-        FROM incidentes i
-        LEFT JOIN (compatibilidad_incidente_unidad c
-                   INNER JOIN tipos_unidad t ON t.id_tipo_unidad = c.id_tipo_unidad
-                                            AND t.activo = 1)
-               ON c.id_tipo_incidente = i.id_tipo_incidente AND c.activo = 1
-        LEFT JOIN (unidades u
-                   INNER JOIN estados_unidad s ON s.id_estado_unidad = u.id_estado_unidad
-                                              AND s.codigo = %s
-                   INNER JOIN estaciones e ON e.id_estacion = u.id_estacion AND e.activo = 1)
-               ON u.id_tipo_unidad = t.id_tipo_unidad AND u.activo = 1
+        """ + _RECOMMENDATION_FROM + """
         WHERE i.id_incidente = %s
         ORDER BY c.prioridad_recomendacion, t.nombre, t.id_tipo_unidad,
                  e.codigo, u.codigo, u.id_unidad
@@ -1553,3 +1561,65 @@ def get_unit_recommendations_for_incident(incident_id):
             })
             item["available_count"] += 1
     return list(recommendations.values())
+
+
+def _approx_distance_km(lat1, lon1, lat2, lon2):
+    """Distancia aproximada en km (círculo máximo, radio terrestre 6371 km).
+
+    Solo sirve como criterio de orden; None si falta alguna coordenada.
+    """
+    if None in (lat1, lon1, lat2, lon2):
+        return None
+    lat1, lon1, lat2, lon2 = (math.radians(float(v)) for v in (lat1, lon1, lat2, lon2))
+    a = (math.sin((lat2 - lat1) / 2) ** 2
+         + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2)
+    return round(2 * 6371.0 * math.asin(min(1.0, math.sqrt(a))), 2)
+
+
+def get_unit_candidates_for_incident(incident_id):
+    """Unidades candidatas individuales para el incidente, ordenadas y explicables.
+
+    Orden: prioridad de recomendación, distancia conocida antes que desconocida,
+    distancia, código de estación, código de unidad e id. Solo lectura, una consulta.
+    """
+    _require_ids(incident_id=incident_id)
+    rows = _fetch_all(
+        """
+        SELECT u.id_unidad AS unit_id, u.codigo AS unit_code, u.nombre AS unit_name,
+               t.id_tipo_unidad AS unit_type_id, t.nombre AS unit_type_name,
+               e.id_estacion AS station_id, e.codigo AS station_code,
+               e.nombre AS station_name, c.prioridad_recomendacion AS priority,
+               c.observacion AS note, i.latitud AS incident_lat, i.longitud AS incident_lon,
+               e.latitud AS station_lat, e.longitud AS station_lon
+        """ + _RECOMMENDATION_FROM + """
+        WHERE i.id_incidente = %s
+        """,
+        (AVAILABLE_UNIT_STATE_CODE, incident_id),
+    )
+    if not rows:
+        raise DispatchIncidentNotFoundError("El incidente no existe.")
+    candidates = []
+    for row in rows:
+        if row["unit_id"] is None:
+            continue
+        candidates.append({
+            "unit_id": row["unit_id"],
+            "unit_code": row["unit_code"],
+            "unit_name": row["unit_name"],
+            "unit_type_id": row["unit_type_id"],
+            "unit_type_name": row["unit_type_name"],
+            "station_id": row["station_id"],
+            "station_code": row["station_code"],
+            "station_name": row["station_name"],
+            "recommendation_priority": row["priority"],
+            "recommendation_note": row["note"],
+            "approx_distance": _approx_distance_km(
+                row["incident_lat"], row["incident_lon"],
+                row["station_lat"], row["station_lon"]),
+        })
+    candidates.sort(key=lambda c: (
+        c["recommendation_priority"],
+        c["approx_distance"] is None,
+        c["approx_distance"] if c["approx_distance"] is not None else 0.0,
+        c["station_code"], c["unit_code"], c["unit_id"]))
+    return candidates

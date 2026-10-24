@@ -1,4 +1,5 @@
 import re
+from uuid import uuid4
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -68,6 +69,13 @@ class DispatchViewTest(DispatchTestBase):
              "(SELECT id_despacho_unidad FROM despacho_unidades WHERE id_unidad IN "
              "(SELECT id_unidad FROM unidades WHERE codigo LIKE %s))",
              (self.unit_prefix + "%",)),
+        ]
+        steps += [
+            ("DELETE FROM compatibilidad_incidente_unidad WHERE id_tipo_incidente = %s", (t,))
+            for t in self.type_ids
+        ] + [
+            ("DELETE FROM compatibilidad_incidente_unidad WHERE id_tipo_unidad = %s", (t,))
+            for t in self.unit_type_ids
         ]
         steps += super().cleanup_steps()
         steps.append(("DELETE FROM personal WHERE codigo LIKE %s", (self.person_prefix + "%",)))
@@ -1328,13 +1336,16 @@ class DispatchViewTest(DispatchTestBase):
              "available_count": 2, "available_units": []},
         ]
         with mock.patch.object(dispatch_controller, "get_unit_recommendations",
-                               return_value=rows):
+                               return_value=rows), \
+                mock.patch.object(dispatch_controller, "get_unit_candidates", return_value=[]):
             view.refresh_button.invoke()
         self.assertEqual(self.recommendations_text(view), (
             "1. Alfa — 0 disponibles\n    Con nota\n2. Beta — 1 disponible\n"
-            "3. Gama — 2 disponibles"))
+            "3. Gama — 2 disponibles\n\nUnidades candidatas\n"
+            "No hay unidades disponibles compatibles."))
         with mock.patch.object(dispatch_controller, "get_unit_recommendations",
-                               return_value=[]):
+                               return_value=[]), \
+                mock.patch.object(dispatch_controller, "get_unit_candidates", return_value=[]):
             view.refresh_button.invoke()
         self.assertEqual(self.recommendations_text(view), dispatch_view.RECOMMENDATIONS_EMPTY)
         self.assertEqual(
@@ -1358,13 +1369,16 @@ class DispatchViewTest(DispatchTestBase):
         view = self.open_view("consulta.sur")
         with mock.patch.object(
                 dispatch_controller, "get_unit_recommendations",
-                wraps=dispatch_controller.get_unit_recommendations) as spy:
+                wraps=dispatch_controller.get_unit_recommendations) as spy, \
+                mock.patch.object(
+                    dispatch_controller, "get_unit_candidates",
+                    wraps=dispatch_controller.get_unit_candidates) as spy_units:
             self.select_dispatch(view, dispatch_id)
-            self.assertEqual(spy.call_count, 1)
+            self.assertEqual((spy.call_count, spy_units.call_count), (1, 1))
             self.assertTrue(self.recommendations_text(view).startswith("1. "))
             view.refresh_button.invoke()
             view.update()
-            self.assertEqual(spy.call_count, 2)
+            self.assertEqual((spy.call_count, spy_units.call_count), (2, 2))
         texts = set()
 
         def walk(widget):
@@ -1394,6 +1408,88 @@ class DispatchViewTest(DispatchTestBase):
         self.assertNotIn("SELECT", text)
         self.assertEqual(self.recommendations_text(view), dispatch_view.RECOMMENDATIONS_ERROR)
         self.assertEqual(view.selected_id, dispatch_id)
+
+    def compat_setup(self, with_coordinates=True):
+        """Tipos temporales con prioridad 1 y 2 y un incidente con coordenadas."""
+        incident_type, near_type, far_type = self.temp_type(), self.temp_unit_type(), self.temp_unit_type()
+        for unit_type, priority, note in ((far_type, 1, "Principal"), (near_type, 2, None)):
+            db_exec(
+                "INSERT INTO compatibilidad_incidente_unidad (id_tipo_incidente, "
+                "id_tipo_unidad, prioridad_recomendacion, observacion, activo) "
+                "VALUES (%s, %s, %s, %s, 1)", (incident_type, unit_type, priority, note))
+        incident_id = self.insert_incident("K", tipo=incident_type)
+        db_exec("UPDATE incidentes SET latitud = 14.0, longitud = -90.0 WHERE id_incidente = %s",
+                (incident_id,))
+        return incident_id, near_type, far_type
+
+    def coordinate_station(self, lat, lon):
+        station_id = db_exec(
+            "INSERT INTO estaciones (codigo, nombre, direccion, latitud, longitud) "
+            "VALUES (%s, 'Estación temporal', 'Dir', %s, %s)",
+            (f"TUS-{uuid4().hex[:8]}", lat, lon))
+        self.station_ids.append(station_id)
+        return station_id
+
+    def test_candidate_units_listed_in_controller_order(self):
+        incident_id, near_type, far_type = self.compat_setup()
+        far_station = self.coordinate_station(14.08, -90.0)
+        near_station = self.coordinate_station(14.01, -90.0)
+        blind_station = self.coordinate_station(None, None)
+        self.temp_unit(station_id=near_station, type_id=near_type, name="Cercana")
+        self.temp_unit(station_id=far_station, type_id=far_type, name="Lejana")
+        self.temp_unit(station_id=blind_station, type_id=far_type)
+        dispatch_id = self.draft_for(incident_id)
+        view = self.open_view("operador.central")
+        self.select_dispatch(view, dispatch_id)
+        expected = dispatch_controller.get_unit_candidates(incident_id)
+        text = self.recommendations_text(view)
+        self.assertEqual(len(expected), 3)
+        positions = []
+        for candidate in expected:
+            self.assertIn(candidate["unit_code"], text)
+            self.assertIn(candidate["unit_type_name"], text)
+            self.assertIn(candidate["station_code"], text)
+            positions.append(text.index(candidate["unit_code"] + " "
+                                        if candidate["unit_name"] else candidate["unit_code"]))
+        self.assertEqual(positions, sorted(positions))
+        # Prioridad 1 lejana antes que prioridad 2 cercana
+        self.assertEqual([c["recommendation_priority"] for c in expected], [1, 1, 2])
+        self.assertIn("Lejana", text.split("Unidades candidatas")[1].splitlines()[1])
+        self.assertIn("Prioridad 1 · Principal", text)
+        self.assertIn("Prioridad 2", text)
+        self.assertIn(" km", text)
+        self.assertIn(dispatch_view.NO_DISTANCE_TEXT, text)
+        self.assertNotIn("None", text)
+
+    def test_candidates_empty_still_shows_types_with_zero(self):
+        incident_id, near_type, far_type = self.compat_setup()
+        dispatch_id = self.draft_for(incident_id)
+        view = self.open_view("operador.central")
+        self.select_dispatch(view, dispatch_id)
+        text = self.recommendations_text(view)
+        self.assertEqual(text.count("0 disponibles"), 2)
+        self.assertIn("Unidades candidatas\n" + dispatch_view.NO_CANDIDATES_TEXT, text)
+
+    def test_candidates_visible_to_read_only_user_and_errors_are_generic(self):
+        incident_id, near_type, far_type = self.compat_setup()
+        station = self.coordinate_station(14.01, -90.0)
+        unit_id = self.temp_unit(station_id=station, type_id=far_type, name="Visible")
+        dispatch_id = self.draft_for(incident_id)
+        reader = self.open_view("consulta.sur")
+        self.select_dispatch(reader, dispatch_id)
+        self.assertIn(self.unit_code(1) + " — Visible", self.recommendations_text(reader))
+        for name in WRITE_BUTTONS + ("add_crew_button", "remove_crew_button"):
+            self.assertEqual(self.state(getattr(reader, name)), "disabled", name)
+        error = DispatchServiceError("SELECT * FROM unidades Traceback")
+        with mock.patch.object(dispatch_controller, "get_unit_candidates", side_effect=error), \
+                self.assertLogs("views.dispatch_view", level="ERROR"):
+            reader.refresh_button.invoke()
+        text = reader.message_label.cget("text")
+        self.assertEqual(text, MSG_INTERNAL)
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("SELECT", text)
+        self.assertEqual(self.recommendations_text(reader), dispatch_view.RECOMMENDATIONS_ERROR)
+        self.assertIsNotNone(unit_id)
 
     def test_refresh_keeps_selection_filters_and_typed_text(self):
         self.insert_incident("A")

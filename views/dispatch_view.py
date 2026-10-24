@@ -53,6 +53,8 @@ TAB_CREW = "Tripulación"
 TAB_RECOMMENDATIONS = "Recomendaciones"
 RECOMMENDATIONS_PLACEHOLDER = "Seleccione un despacho para ver las recomendaciones."
 RECOMMENDATIONS_EMPTY = "Sin recomendaciones configuradas para este tipo de incidente."
+NO_CANDIDATES_TEXT = "No hay unidades disponibles compatibles."
+NO_DISTANCE_TEXT = "distancia no disponible"
 RECOMMENDATIONS_ERROR = "No se pudieron cargar las recomendaciones."
 CREW_EMPTY_TEXT = "Seleccione una unidad"
 MSG_NO_CANDIDATES = "No hay personal disponible para asignar."
@@ -674,12 +676,16 @@ class DispatchView(ctk.CTkToplevel):
         self.recommendations_text.configure(state="disabled")
 
     def _load_recommendations(self, incident_id):
-        """Una sola consulta por recarga; muestra la lista numerada o un aviso."""
-        ok, rows = self._run(dispatch_controller.get_unit_recommendations, incident_id)
-        if not ok:
+        """Dos consultas por recarga: tipos recomendados y unidades candidatas."""
+        ok_types, rows = self._run(dispatch_controller.get_unit_recommendations, incident_id)
+        if not ok_types:
             self._set_recommendations(RECOMMENDATIONS_ERROR)
             return
-        if not rows:
+        ok_units, candidates = self._run(dispatch_controller.get_unit_candidates, incident_id)
+        if not ok_units:
+            self._set_recommendations(RECOMMENDATIONS_ERROR)
+            return
+        if not rows and not candidates:
             self._set_recommendations(RECOMMENDATIONS_EMPTY)
             return
         lines = []
@@ -689,6 +695,24 @@ class DispatchView(ctk.CTkToplevel):
             lines.append(f"{index}. {row['unit_type_name']} — {count} {noun}")
             if row.get("note"):
                 lines.append(f"    {row['note']}")
+        lines.append("")
+        lines.append("Unidades candidatas")
+        if not candidates:
+            lines.append(NO_CANDIDATES_TEXT)
+        for index, unit in enumerate(candidates, start=1):
+            title = unit["unit_code"]
+            if unit.get("unit_name"):
+                title = f"{title} — {unit['unit_name']}"
+            distance = unit.get("approx_distance")
+            distance_text = NO_DISTANCE_TEXT if distance is None else f"{distance:.1f} km"
+            detail = f"Prioridad {unit['recommendation_priority']}"
+            if unit.get("recommendation_note"):
+                detail += f" · {unit['recommendation_note']}"
+            lines.append(f"{index}. {title}")
+            lines.append(
+                f"   {unit['unit_type_name']} · {unit['station_code']} · {distance_text}"
+            )
+            lines.append(f"   {detail}")
         self._set_recommendations("\n".join(lines))
 
     def _load_crew(self):
